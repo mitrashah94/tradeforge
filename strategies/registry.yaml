@@ -1,0 +1,20 @@
+# strategies/registry.yaml — strategy status, edge stats, correlation, allocation.
+# Status lifecycle: RESEARCH -> BACKTEST -> PAPER -> LIVE (demote LIVE->PAPER on decay).
+# Launch scope (CLAUDE.md): one validated edge live, two uncorrelated complements in research.
+strategies:
+  breakout_retest:
+    status: PAPER            # the PF-2.24 baseline; promote PAPER->LIVE only after the gate clears
+    regime: trend_continuation
+    allocation: 0.0
+    edge: {pf: null, expectancy_r: null, trades: 0}
+  level_meanrev:
+    status: RESEARCH         # uncorrelated complement for chop/range
+    regime: mean_reversion
+    allocation: 0.0
+    edge: {pf: null, expectancy_r: null, trades: 0}
+  momentum_thrust:
+    status: RESEARCH         # uncorrelated complement for trend/thrust
+    regime: momentum
+    allocation: 0.0
+    edge: {pf: null, expectancy_r: null, trades: 0}
+correlation_matrix: {}       # populated live; CORE must stay genuinely diversified

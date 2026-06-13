@@ -1,0 +1,17 @@
+{
+  "_comment": "Fill command/args/url with your actual MCP server configs. TradingView + Robinhood agentic MCP.",
+  "mcpServers": {
+    "tradingview": {
+      "type": "stdio",
+      "command": "REPLACE_WITH_TRADINGVIEW_MCP_COMMAND",
+      "args": [],
+      "env": {}
+    },
+    "robinhood": {
+      "type": "stdio",
+      "command": "REPLACE_WITH_ROBINHOOD_MCP_COMMAND",
+      "args": [],
+      "env": { "ROBINHOOD_TOKEN": "${ROBINHOOD_TOKEN}" }
+    }
+  }
+}

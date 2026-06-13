@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "place_equity_order|place_crypto_order|place_option_order|order_gateway_live",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/block_live_orders.py\""
+          }
+        ]
+      }
+    ]
+  }
+}
