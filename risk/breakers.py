@@ -62,3 +62,35 @@ def program_abort_state(
     if month_drawdown_pct >= pa.monthly_review_drawdown_pct:
         return "review"
     return "ok"
+
+
+# --- P3 bus-driven wrapper -----------------------------------------------------
+# The pure functions above are unchanged. The stateful, bus-driven breaker
+# service that wraps them lives in ``risk/breaker_service.py``; it is re-exported
+# here so ``from risk.breakers import BreakerService`` keeps working alongside the
+# predicates.
+#
+# CIRCULAR-IMPORT FIX (P3 integration seam #1): ``risk.breaker_service`` imports
+# the pure functions from THIS module at its own import time. A plain
+# ``from risk.breaker_service import BreakerService`` at module scope here would
+# deadlock when ``breaker_service`` is imported FIRST (it would re-enter this
+# module before ``BreakerService`` is defined). We therefore expose the
+# convenience alias LAZILY via module ``__getattr__`` (PEP 562): the symbol is
+# resolved only on first access, by which point both modules are fully
+# initialised, regardless of which was imported first.
+__all__ = [
+    "daily_halt_breached",
+    "weekly_halt_breached",
+    "heat_breached",
+    "program_abort_state",
+    "BreakerService",
+]
+
+
+def __getattr__(name: str):
+    """Lazily re-export ``BreakerService`` (PEP 562) to break the import cycle."""
+    if name == "BreakerService":
+        from risk.breaker_service import BreakerService  # local import: lazy
+
+        return BreakerService
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
