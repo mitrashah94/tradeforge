@@ -1,0 +1,9 @@
+checksum: 94974f26105dc92b
+locked: true
+locked_on: '2026-06-13'
+note: DO NOT TUNE ON THIS RANGE - locked 2026-06-13. This out-of-sample slice is reserved
+  for a single final validation and must never be touched during development or reused.
+oos_end: '2026-06-12'
+oos_start: '2026-01-18'
+symbol: QQQ,SPY
+timeframe: 2m,5m

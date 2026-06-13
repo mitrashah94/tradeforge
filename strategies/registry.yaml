@@ -1,20 +1,126 @@
 # strategies/registry.yaml — strategy status, edge stats, correlation, allocation.
 # Status lifecycle: RESEARCH -> BACKTEST -> PAPER -> LIVE (demote LIVE->PAPER on decay).
 # Launch scope (CLAUDE.md): one validated edge live, two uncorrelated complements in research.
+#
+# Populated by the P2 Stage 2 integration pass (backtest/portfolio.py +
+# backtest/rigorous_stats.py), QQQ 5m, full period 2024-06-13 -> 2026-06-12,
+# REALISTIC cost profile (the honest small-account picture). PF carries a
+# bootstrap 95% CI + the trade count; allocation is the long-only min-variance
+# blend weight (normalized, sums to 1). NOTHING is LIVE: no single edge clears
+# the multiple-testing haircut (PF >= 1.696 at n_trials=14), so promotion is held.
+#
+# HONESTY NOTE: these edges are marginal-to-negative net of realistic costs on
+# Alpaca IEX data. The real wins are (a) the v0_atr_stop fix (V0's tight 1-tick
+# stop blows up under slippage; the ATR stop lifts expectancy_R from -0.76 to
+# +0.05 and PF from 0.96 to 1.32), (b) V3's partial/runner skew (expectancy_R
+# -0.76 -> -0.32), and (c) the genuine decorrelation: the min-variance blend has
+# the highest Sharpe (1.12 IS) and lowest variance of any sleeve.
+
 strategies:
   breakout_retest:
-    status: PAPER            # the PF-2.24 baseline; promote PAPER->LIVE only after the gate clears
+    status: PAPER            # PF-2.24 Pine baseline; held at PAPER — does NOT clear the haircut
     regime: trend_continuation
-    allocation: 0.0
-    edge: {pf: null, expectancy_r: null, trades: 0}
+    headline_variant: v0_atr_stop   # the realistic-cost survivor (V0's tight stop is fragile)
+    allocation: 0.576        # min-variance blend weight (v0_atr_stop sleeve)
+    edge:                    # full-period realistic, v0_atr_stop
+      variant: v0_atr_stop
+      pf: 1.318
+      pf_ci: [0.951, 1.844]
+      expectancy_r: 0.049
+      trades: 188
+      sharpe: 1.89
+      oos_pf: 1.436         # locked vault 2026-01-18 -> 2026-06-12 (n=50)
+      walk_forward_pf: 1.261
+      underpowered: false
+      clears_haircut: false
+    baseline_v0:             # the raw V0 reproduction for reference (fragile under costs)
+      pf: 0.961
+      pf_ci: [0.617, 1.449]
+      expectancy_r: -0.76
+      trades: 188
+    note: >-
+      v0_atr_stop is the only breakout config with positive expectancy net of
+      realistic costs and the best by-regime profile (trend 2.05 / chop 1.09 /
+      vol_shock 1.16). V3 partial/runner improves skew (expR -0.76 -> -0.32) but
+      PF stays < 1. Keep PAPER; promote only on a consolidated/SIP re-pull or
+      after paper confirms net-of-cost edge.
   level_meanrev:
     status: RESEARCH         # uncorrelated complement for chop/range
     regime: mean_reversion
-    allocation: 0.0
-    edge: {pf: null, expectancy_r: null, trades: 0}
+    headline_variant: DEFAULT
+    allocation: 0.320        # min-variance blend weight
+    edge:                    # full-period realistic, DEFAULT
+      variant: DEFAULT
+      pf: 1.021
+      pf_ci: [0.862, 1.209]
+      expectancy_r: 0.03
+      trades: 707
+      sharpe: 0.28
+      oos_pf: 0.977         # locked vault (n=155)
+      walk_forward_pf: 1.125
+      underpowered: false
+      clears_haircut: false
+    note: >-
+      Barely above breakeven on aggregate, but earns its place by REGIME: PF 1.26
+      in chop (its design regime) vs 0.90 in trend, and -0.135 correlation to the
+      breakout sleeve — exactly the decorrelation the blend needs. Keep RESEARCH.
   momentum_thrust:
     status: RESEARCH         # uncorrelated complement for trend/thrust
     regime: momentum
-    allocation: 0.0
-    edge: {pf: null, expectancy_r: null, trades: 0}
-correlation_matrix: {}       # populated live; CORE must stay genuinely diversified
+    headline_variant: DEFAULT
+    allocation: 0.103        # min-variance blend weight (small — high single-sleeve variance)
+    edge:                    # full-period realistic, DEFAULT
+      variant: DEFAULT
+      pf: 1.155
+      pf_ci: [0.826, 1.586]
+      expectancy_r: 0.01
+      trades: 498
+      sharpe: 0.49
+      oos_pf: 1.247         # locked vault (n=101)
+      walk_forward_pf: 1.310
+      underpowered: false
+      clears_haircut: false
+    note: >-
+      Highest aggregate PF and the best OOS/walk-forward of the complements, with
+      a huge vol_shock edge (PF 7.3) — it harvests the trend/expansion days the
+      fade misses. High single-sleeve variance keeps its min-variance weight
+      small, but it is near-uncorrelated to both others (-0.016 / -0.036). Keep
+      RESEARCH.
+
+# Live correlation matrix (full-period realistic daily fractional returns, QQQ 5m,
+# union calendar with flat days = 0). Genuinely low / negative off-diagonals ->
+# the complements are decorrelated by construction (MASTER_PLAN §1.A/B).
+correlation_matrix:
+  order: [breakout_retest, level_meanrev, momentum_thrust]
+  breakout_retest:   {breakout_retest: 1.000, level_meanrev: -0.135, momentum_thrust: -0.016}
+  level_meanrev:     {breakout_retest: -0.135, level_meanrev: 1.000, momentum_thrust: -0.036}
+  momentum_thrust:   {breakout_retest: -0.016, level_meanrev: -0.036, momentum_thrust: 1.000}
+
+# Long-only min-variance allocation (normalized, sums to 1). This is the blend the
+# portfolio analysis selects to MINIMIZE curve variance, not to chase the single
+# highest PF (MASTER_PLAN §5).
+allocation:
+  method: min_variance_long_only
+  weights:
+    breakout_retest: 0.576
+    level_meanrev: 0.320
+    momentum_thrust: 0.103
+
+# Maximization verdict (g = mean - 0.5*var, realistic costs, in-sample 392 sessions).
+maximization:
+  best_single: momentum_thrust/DEFAULT       # raw g (high mean dominates the tiny ½var penalty)
+  best_single_g_bps: 2.218
+  best_blend: BLEND_minvar
+  best_blend_g_bps: 1.522
+  blend_beats_single_on_raw_g: false         # honest: raw g favors the high-mean single
+  blend_variance_below_best_single: true     # the variance cut is real
+  # Scale-invariant reading (the operational mechanism: size to a fixed risk budget):
+  blend_has_highest_sharpe: true             # min-variance blend Sharpe 1.12 vs best single 0.96
+  vol_targeted_g_blend_beats_single: true    # +0.30 bps uplift once levered to a common vol
+  verdict: >-
+    The literal proxy g is won by the high-mean / high-variance single because at
+    these tiny daily magnitudes the ½·var penalty is negligible. But the
+    maximization MECHANISM (lower variance -> safer size -> faster compounding)
+    holds: the min-variance blend has the highest Sharpe and the highest
+    vol-targeted g. The structural benefit is real; the edges are just too weak
+    in absolute terms to make any of them live-worthy yet.

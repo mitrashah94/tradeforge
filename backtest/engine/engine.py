@@ -105,6 +105,27 @@ class Bar:
 
 
 @dataclass
+class PartialPlan:
+    """Optional partial-exit + trailing-runner plan attached to an entry (V3/V4).
+
+    When present on a :class:`Position`, the engine scales out ``fraction`` of
+    the position at ``tp1`` (a resting limit, ~+``tp1_r``R), then moves the stop
+    to breakeven (the entry's ``signal_close``) and trails the REMAINING shares
+    by the prior managed bar's low (long) / high (short) until the runner's stop
+    is hit or EOD-flat. This produces the positive-skew structure of MASTER_PLAN
+    §1.B (cut losers fast, let winners run).
+
+    V0/V1/V2 entries carry no PartialPlan, so the engine's exit path is
+    unchanged for them (fixed-2R or no target).
+    """
+
+    tp1: float                # price of the first (partial) scale-out limit
+    tp1_r: float              # R multiple of tp1 (diagnostic)
+    fraction: float           # fraction of shares taken at tp1 (e.g. 0.5)
+    trail_mode: str = "prior_bar"  # how the runner stop trails
+
+
+@dataclass
 class Position:
     """An open position with its (signal-close-derived) bracket."""
 
@@ -121,6 +142,13 @@ class Position:
     bars_held: int = 0
     mfe: float = 0.0          # max favorable excursion in price (>=0)
     mae: float = 0.0          # max adverse excursion in price (>=0)
+    # ---- partial + runner state (V3/V4); None/0 keeps the V0 path intact ----
+    partial: "PartialPlan | None" = None
+    initial_shares: float = 0.0   # shares at entry (for partial accounting)
+    partial_done: bool = False    # True once the TP1 scale-out has filled
+    realized_partial_pnl: float = 0.0  # net P&L booked from the partial fill
+    realized_partial_r: float = 0.0    # R booked from the partial (size-weighted)
+    ref_stop: float = 0.0         # original entry stop (runner risk basis; pre-trail)
 
 
 @dataclass
@@ -133,6 +161,7 @@ class _PendingOrder:
     target: float | None
     signal_close: float | None
     signal_ts: datetime | None
+    partial: "PartialPlan | None" = None  # V3/V4 only; None keeps V0 path
 
 
 # --------------------------------------------------------------------------- #
@@ -163,11 +192,21 @@ class Context:
         return self._engine.position
 
     # ----- order requests (queued; executed at next bar open) -----
-    def enter_long(self, stop: float, target: float | None = None) -> None:
-        self._engine.request_entry("long", stop, target)
+    def enter_long(
+        self,
+        stop: float,
+        target: float | None = None,
+        partial: "PartialPlan | None" = None,
+    ) -> None:
+        self._engine.request_entry("long", stop, target, partial)
 
-    def enter_short(self, stop: float, target: float | None = None) -> None:
-        self._engine.request_entry("short", stop, target)
+    def enter_short(
+        self,
+        stop: float,
+        target: float | None = None,
+        partial: "PartialPlan | None" = None,
+    ) -> None:
+        self._engine.request_entry("short", stop, target, partial)
 
     def close(self) -> None:
         self._engine.request_close()
@@ -289,7 +328,13 @@ class BacktestEngine:
         )
 
     # ----- order requests routed from the Context -----
-    def request_entry(self, side: str, stop: float, target: float | None) -> None:
+    def request_entry(
+        self,
+        side: str,
+        stop: float,
+        target: float | None,
+        partial: "PartialPlan | None" = None,
+    ) -> None:
         """Queue a market entry to fill at the next bar's open (Pine parity)."""
         if self.position is not None:
             return  # already in a position; ignore (one position at a time)
@@ -301,6 +346,7 @@ class BacktestEngine:
             target=target,
             signal_close=bar.close,
             signal_ts=bar.ts,
+            partial=partial,
         )
 
     def request_close(self) -> None:
@@ -408,6 +454,9 @@ class BacktestEngine:
             entry_commission=entry_comm,
             signal_close=pend.signal_close,
             entry_bar_index=bar_index,
+            partial=pend.partial,
+            initial_shares=shares,
+            ref_stop=pend.stop,
         )
 
     def _size(self, fill_price: float) -> float:
@@ -435,6 +484,9 @@ class BacktestEngine:
         pos = self.position
         if pos is None:
             return
+        if pos.partial is not None:
+            self._manage_partial_bracket(bar)
+            return
         stop = pos.stop
         target = pos.target
 
@@ -460,6 +512,121 @@ class BacktestEngine:
                 self._exit_position(bar, stop, FILL_STOP, "stop")
             elif hit_target:
                 self._exit_position(bar, target, FILL_LIMIT, "target")
+
+    # ------------------------------------------------ partial + runner mgmt
+    def _manage_partial_bracket(self, bar: Bar) -> None:
+        """Resolve a partial-exit + trailing-runner position against ``bar``.
+
+        Two phases (V3/V4 positive-skew structure, MASTER_PLAN §1.B):
+
+        PHASE 1 (before TP1): the full position rests with a protective stop and
+        a partial-limit at ``tp1``. Stop-first on ambiguity, exactly like the
+        fixed bracket. If TP1 is reached, scale out ``fraction`` at the tp1
+        limit, book that partial P&L on the position, and move the runner's stop
+        to breakeven (the entry signal close). The runner survives to phase 2.
+
+        PHASE 2 (runner): no fixed target — the stop trails by the PRIOR managed
+        bar's low (long) / high (short), never loosening. A hit closes the
+        runner (reason ``trail_stop``); otherwise EOD-flat closes it at the
+        session close, folding the booked partial P&L into the final record.
+        """
+        pos = self.position
+        if pos is None:
+            return
+        pl = pos.partial
+
+        if not pos.partial_done:
+            # ---- PHASE 1: original stop + partial limit at tp1 -------------
+            stop = pos.stop
+            if pos.side == "long":
+                if self.model_stop_gaps and bar.open <= stop:
+                    self._exit_position(bar, bar.open, FILL_STOP, "stop_gap")
+                    return
+                hit_stop = bar.low <= stop
+                hit_tp1 = bar.high >= pl.tp1
+                if hit_stop:                   # stop-first on ambiguity
+                    self._exit_position(bar, stop, FILL_STOP, "stop")
+                    return
+                if hit_tp1:
+                    self._scale_out_partial(bar, pl.tp1)
+            else:  # short
+                if self.model_stop_gaps and bar.open >= stop:
+                    self._exit_position(bar, bar.open, FILL_STOP, "stop_gap")
+                    return
+                hit_stop = bar.high >= stop
+                hit_tp1 = bar.low <= pl.tp1
+                if hit_stop:
+                    self._exit_position(bar, stop, FILL_STOP, "stop")
+                    return
+                if hit_tp1:
+                    self._scale_out_partial(bar, pl.tp1)
+            return
+
+        # ---- PHASE 2: runner with a trailing stop (no fixed target) -------
+        stop = pos.stop
+        if pos.side == "long":
+            if self.model_stop_gaps and bar.open <= stop:
+                self._exit_position(bar, bar.open, FILL_STOP, "stop_gap")
+                return
+            if bar.low <= stop:
+                self._exit_position(bar, stop, FILL_STOP, "trail_stop")
+                return
+            # Trail up by this bar's low (becomes the next bar's stop floor).
+            if pl.trail_mode == "prior_bar":
+                pos.stop = max(pos.stop, bar.low)
+        else:  # short
+            if self.model_stop_gaps and bar.open >= stop:
+                self._exit_position(bar, bar.open, FILL_STOP, "stop_gap")
+                return
+            if bar.high >= stop:
+                self._exit_position(bar, stop, FILL_STOP, "trail_stop")
+                return
+            if pl.trail_mode == "prior_bar":
+                pos.stop = min(pos.stop, bar.high)
+
+    def _scale_out_partial(self, bar: Bar, tp1: float) -> None:
+        """Sell ``fraction`` of the position at the ``tp1`` resting limit.
+
+        Books the partial's net P&L and size-weighted R on the position, shrinks
+        the share count to the runner, and moves the runner's stop to breakeven
+        (the entry signal close). The remaining shares ride until the trailing
+        stop or EOD-flat, at which point :meth:`_exit_position` folds in the
+        booked partial.
+        """
+        pos = self.position
+        if pos is None or pos.partial_done:
+            return
+        pl = pos.partial
+        part_shares = pos.initial_shares * pl.fraction
+        if part_shares <= 0 or part_shares >= pos.shares:
+            return  # degenerate; leave the position whole
+
+        exit_fill = self.cost_model.apply_exit(
+            pos.side, tp1, self.asset_class, FILL_LIMIT
+        )
+        exit_comm = self.cost_model.commission(
+            part_shares, part_shares * exit_fill, self.asset_class
+        )
+        if pos.side == "long":
+            gross = (exit_fill - pos.entry_price) * part_shares
+        else:
+            gross = (pos.entry_price - exit_fill) * part_shares
+        net = gross - exit_comm
+        self.equity += net
+
+        risk_per_share = abs(pos.signal_close - pos.stop)
+        if pos.side == "long":
+            move = exit_fill - pos.entry_price
+        else:
+            move = pos.entry_price - exit_fill
+        r = (move / risk_per_share) if risk_per_share > 0 else 0.0
+
+        pos.realized_partial_pnl += net
+        pos.realized_partial_r += r * pl.fraction  # size-weight the booked R
+        pos.shares -= part_shares
+        pos.partial_done = True
+        # Move the runner's stop to breakeven (the entry signal close).
+        pos.stop = pos.signal_close
 
     def _update_excursions(self, bar: Bar) -> None:
         pos = self.position
@@ -496,12 +663,27 @@ class BacktestEngine:
 
         # Realized R is measured against the signal-bar risk (Pine parity:
         # bracket is pinned to the signal close, entry filled at next open).
-        risk_per_share = abs(pos.signal_close - pos.stop)
+        # For a runner, the risk is the ORIGINAL stop distance (the runner's own
+        # ``stop`` has trailed / moved to breakeven), so use the entry stop kept
+        # implicit in signal_close-vs-original-risk via the partial's R bookkeep.
+        if pos.partial is not None and pos.initial_shares > 0:
+            risk_per_share = abs(pos.signal_close - pos.ref_stop)
+        else:
+            risk_per_share = abs(pos.signal_close - pos.stop)
         if pos.side == "long":
             price_move = exit_fill - pos.entry_price
         else:
             price_move = pos.entry_price - exit_fill
-        r_multiple = price_move / risk_per_share if risk_per_share > 0 else 0.0
+        runner_r = price_move / risk_per_share if risk_per_share > 0 else 0.0
+
+        # Fold in any booked partial P&L and size-weight the runner's R.
+        if pos.partial is not None and pos.initial_shares > 0:
+            runner_fraction = pos.shares / pos.initial_shares
+            gross += pos.realized_partial_pnl  # partial was net-of-comm already
+            net += pos.realized_partial_pnl
+            r_multiple = pos.realized_partial_r + runner_r * runner_fraction
+        else:
+            r_multiple = runner_r
 
         self.equity += net
 
@@ -515,7 +697,7 @@ class BacktestEngine:
                 exit_price=exit_fill,
                 ref_entry_price=pos.ref_entry_price,
                 signal_close=pos.signal_close,
-                stop=pos.stop,
+                stop=(pos.ref_stop if pos.partial is not None else pos.stop),
                 target=pos.target,
                 shares=pos.shares,
                 gross_pnl=gross,

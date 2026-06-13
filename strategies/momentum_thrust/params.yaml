@@ -1,0 +1,60 @@
+# strategies/momentum_thrust/params.yaml — sweepable parameters for the
+# momentum THRUST continuation strategy (the trend-regime complement to
+# level_meanrev). MASTER_PLAN.md §1.A/B and §5.
+#
+# THESIS (decorrelation by construction): level_meanrev FADES extensions back
+# to the mean and wins in chop. momentum_thrust does the OPPOSITE: on a strong
+# directional THRUST (consecutive same-direction closes + an expansion bar with
+# above-average range/volume) it enters WITH the trend and RIDES it on a
+# TRAILING stop (no fixed 2R cap), capturing the big TREND days that a mean-
+# reversion fade is flat or wrong on. Follow vs fade => low correlation.
+#
+# Entry (with-trend THRUST), per RTH session:
+#   LONG  thrust: the current bar is an UP expansion bar — its range >=
+#     range_mult * avg_range(lookback), its volume >= vol_mult * avg_vol, it
+#     closes in the top close_loc fraction of its range, AND it is the Nth
+#     (thrust_bars) consecutive higher CLOSE. Enter LONG at next open.
+#   SHORT thrust: symmetric (down expansion bar, consecutive lower closes).
+#
+# Stop: initial protective stop = entry-side extreme of the thrust bar
+#   -/+ stop_atr*ATR (a hard catastrophe backstop the engine enforces).
+# Exit: NO fixed target. A chandelier-style TRAILING stop ride: trail by
+#   trail_atr*ATR from the best price since entry; the strategy CLOSES at the
+#   next open once price closes through the trail. Optional time_stop_bars
+#   caps stale rides. This fat-right-tail (cut losers at the stop, let winners
+#   run) is the positive-skew structure from MASTER_PLAN.md §1.B.
+
+defaults:
+  # ---- thrust detection ----
+  thrust_bars: 2              # require N consecutive same-direction closes (incl. signal bar)
+  lookback: 20               # bars for the average range / average volume baseline
+  range_mult: 1.3            # signal bar range >= range_mult * avg_range  (expansion)
+  vol_mult: 1.2              # signal bar volume >= vol_mult * avg_volume  (participation)
+  use_volume: true           # if false, ignore the volume filter (range-only thrust)
+  close_loc: 0.6             # bar must close in the top/bottom close_loc of its range
+
+  # ---- stop + trailing exit ----
+  stop_atr: 0.5              # initial protective stop = thrust extreme -/+ stop_atr*ATR
+  trail_atr: 1.5             # chandelier trail distance from best price (ATR units)
+  trail_after_r: 0.0         # only start trailing once price reaches this R of profit
+  time_stop_bars: 0          # close after N bars if still open (0 = disabled)
+
+  # ---- session / regime guards ----
+  warmup_bars: 20            # need `lookback` bars before averages are meaningful
+  one_per_side: true         # at most one long thrust + one short thrust per session
+  tick: 0.01                 # QQQ/SPY tick size
+
+# Named variants. Each lists ONLY its delta from `defaults`.
+# DEFAULT is the variant the integration stage runs uniformly.
+variants:
+  DEFAULT:                   # 2-bar thrust, range+volume expansion, 1.5 ATR trail
+    {}                       # == defaults
+  V0:                        # leanest: range-only thrust (no volume filter)
+    use_volume: false
+  V1:                        # stronger thrust requirement, tighter trail
+    thrust_bars: 3
+    range_mult: 1.5
+    trail_atr: 1.0
+  V2:                        # trail only after 1R of profit is reached (let it prove out)
+    trail_after_r: 1.0
+    time_stop_bars: 24

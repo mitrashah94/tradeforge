@@ -17,13 +17,14 @@ defaults:
   tick: 0.01                  # QQQ/SPY tick size
   levels: [pdh, pdl]          # which levels arm break detection (V0 = PDH/PDL)
 
-  # ---- ablation hooks (RESERVED — params present, logic added in later stages) ----
-  ntz_filter: false           # V1: no entries inside the No-Trade Zone
-  use_pmh_pml: false          # V2: also arm breaks on PMH/PML
-  partial_runner: false       # V3: scale out a partial at TP1, trail a runner
-  partial_tp1_r: 1.0          # R multiple for the partial (V3)
+  # ---- ablation components (LOGIC implemented; gated by these values) ----
+  ntz_filter: false           # V1: no entries whose level is inside the No-Trade Zone
+  use_pmh_pml: false          # V2: also arm break->retest on PMH/PML
+  partial_runner: false       # V3: scale out a partial at TP1, breakeven, trail a runner
+  partial_tp1_r: 1.0          # R multiple for the partial scale-out (V3)
   partial_fraction: 0.5       # fraction of size taken at TP1 (V3)
-  trail_mode: prior_bar       # trailing reference for target_mode=trailing/runner
+  trail_mode: prior_bar       # runner trail reference (target_mode=trailing)
+  atr_stop_k: 0.0             # >0: stop = level -/+ atr_stop_k*ATR14 (v0_atr_stop)
   battle_zone_atr: 0.15       # level +/- battle_zone_atr * ATR (reserved, §5)
   break_buffer_atr: 0.0       # require close beyond level by this * ATR (reserved)
 
@@ -51,3 +52,5 @@ variants:
     partial_runner: true
     target_mode: trailing
     break_buffer_atr: 0.05
+  v0_atr_stop:                 # V0 but stop = level -/+ k*ATR14 (not -/+ 1 tick)
+    atr_stop_k: 0.25

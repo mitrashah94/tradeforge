@@ -1,0 +1,63 @@
+# strategies/level_meanrev/params.yaml — sweepable parameters for the
+# level mean-reversion FADE strategy (the chop/range-regime complement to
+# breakout_retest). MASTER_PLAN.md §1.A/B and §5.
+#
+# THESIS (decorrelation by construction): breakout_retest is a CONTINUATION
+# edge — it BUYS a clean break of PDH and rides it. level_meanrev does the
+# OPPOSITE at the same level: when price EXTENDS to a level (tags PDH/PDL or a
+# session extreme) but FAILS to continue (no clean break / a rejection), it
+# FADES the move back toward the mean (the session midpoint or 1-1.5R). It wins
+# on range/chop days — exactly the days continuation breakouts fail — so its
+# PnL stream is low/negatively correlated with breakout_retest's.
+#
+# Entry (counter-trend FADE), per RTH session, using that session's levels:
+#   SHORT fade: price tags an UPPER level (PDH or PMH, within tag_atr*ATR) and
+#     the bar REJECTS it (closes back below the level, i.e. an upper-wick
+#     rejection / failed poke). Enter SHORT at next open.
+#   LONG  fade: price tags a LOWER level (PDL or PML) and the bar REJECTS it
+#     (closes back above the level). Enter LONG at next open.
+#   A "clean break" (close beyond the level by break_buffer_atr*ATR) DISARMS
+#     the fade on that side — that is breakout_retest's regime, not ours.
+#
+# Stop: just BEYOND the level extreme that was faded (the rejection wick),
+#   padded by stop_buffer_atr*ATR. risk = abs(signal_close - stop).
+# Target: toward the MEAN — the session midpoint (mean_mode=session_mid) or a
+#   fixed R multiple (mean_mode=fixed_r, target_r). Whichever the variant picks.
+
+defaults:
+  # ---- which levels arm a fade (upper levels -> short, lower -> long) ----
+  upper_levels: [pdh, pmh]    # tagging one of these arms a SHORT fade
+  lower_levels: [pdl, pml]    # tagging one of these arms a LONG  fade
+
+  # ---- tag + rejection detection ----
+  tag_atr: 0.10               # "tag" = bar high/low comes within tag_atr*ATR of level
+  require_rejection: true     # require a close back on the mean-side of the level
+  break_buffer_atr: 0.05      # a close beyond level by this*ATR = clean break -> DISARM fade
+
+  # ---- stop + target ----
+  stop_buffer_atr: 0.10       # stop = faded extreme -/+ stop_buffer_atr*ATR
+  mean_mode: fixed_r          # fixed_r | session_mid   (fixed_r = robust 1-1.5R fade)
+  target_r: 1.0               # used when mean_mode=fixed_r (1.0-1.5R fade target)
+  min_target_r: 0.5           # when mean_mode=session_mid, skip if implied target < this R
+  max_stop_atr: 1.0           # skip degenerate setups whose stop is wider than this*ATR
+
+  # ---- session / regime guards ----
+  warmup_bars: 2              # ignore the first N bars (need a session range first)
+  one_per_side: true          # at most one long fade + one short fade per session
+  tick: 0.01                  # QQQ/SPY tick size
+
+# Named variants. Each lists ONLY its delta from `defaults`.
+# DEFAULT is the variant the integration stage runs uniformly.
+variants:
+  DEFAULT:                    # PDH/PDL/PMH/PML fade -> fixed 1R target (robust)
+    {}                        # == defaults
+  V0:                         # leanest: PDH/PDL only, fixed 1.2R target
+    upper_levels: [pdh]
+    lower_levels: [pdl]
+    target_r: 1.2
+  V1:                         # + PMH/PML, fixed 1R target (== defaults, explicit)
+    mean_mode: fixed_r
+    target_r: 1.0
+  V2:                         # session-midpoint target, wider tag tolerance
+    tag_atr: 0.15
+    mean_mode: session_mid
