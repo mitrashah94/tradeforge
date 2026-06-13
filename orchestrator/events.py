@@ -84,6 +84,15 @@ class EventType(str, Enum):
     # --- Resilience ---
     RECONCILED = "RECONCILED"
     HEARTBEAT = "HEARTBEAT"
+    # Watchdog enters SAFE_MODE when the engine heartbeat goes stale (hung
+    # engine). Published alongside a CIRCUIT_BREAKER_TRIPPED so the gateway
+    # refuses NEW orders while the engine is suspect (MASTER_PLAN.md §7).
+    SAFE_MODE = "SAFE_MODE"
+    # The dead-man's switch fired: broker/data lost beyond the timeout WITH an
+    # open position whose LOCAL bracket can no longer be managed. Carries the
+    # action taken ("flatten" or "alert_and_halt"). MANDATORY because brackets
+    # are local (MASTER_PLAN.md §3, §7).
+    DEAD_MANS_SWITCH_TRIPPED = "DEAD_MANS_SWITCH_TRIPPED"
 
 
 # Backwards-compatibility alias. The original stub exported ``Event`` as the

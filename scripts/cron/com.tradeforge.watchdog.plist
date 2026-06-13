@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TradeForge WATCHDOG + DEAD-MAN'S SWITCH (launchd / macOS) — MASTER_PLAN.md §7.
+
+  This runs the watchdog as an INDEPENDENT, always-on process, SEPARATE from the
+  trading engine, so it survives an engine hang/crash and can act when the engine
+  itself is what failed. It reads the durable events.duckdb HEARTBEAT log and, on
+  staleness, publishes SAFE_MODE + CIRCUIT_BREAKER_TRIPPED (the gateway then
+  refuses new orders). On broker/data loss with an open position past dms_timeout
+  it drives the dead-man's switch (cancel+flatten if reachable, else alert-and-halt).
+
+  KeepAlive=true so launchd restarts it if it ever exits — a watchdog that is down
+  is worse than useless.
+
+  Install (copy or symlink this file into ~/Library/LaunchAgents first):
+    launchctl load -w ~/Library/LaunchAgents/com.tradeforge.watchdog.plist
+
+  Uninstall:
+    launchctl unload -w ~/Library/LaunchAgents/com.tradeforge.watchdog.plist
+
+  Run by hand (foreground, paper):
+    PYTHONPATH=. .venv/bin/python -m orchestrator.watchdog \
+        --heartbeat-timeout 15 --dms-timeout 30 --poll-interval 1
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tradeforge.watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-lc</string>
+        <string>cd /Users/mitrashah/Desktop/tradeforge &amp;&amp; exec env PYTHONPATH=. .venv/bin/python -m orchestrator.watchdog --heartbeat-timeout 15 --dms-timeout 30 --poll-interval 1</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mitrashah/Desktop/tradeforge</string>
+
+    <!-- Always-on: start at load and restart if it ever exits. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mitrashah/Desktop/tradeforge/journal/watchdog.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/mitrashah/Desktop/tradeforge/journal/watchdog.err.log</string>
+</dict>
+</plist>

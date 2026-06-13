@@ -91,6 +91,7 @@ class System:
     started: bool = False
     halted_on_boot: bool = False
     recon_result: Any = None
+    watchdog: Any = None  # the armed Watchdog (set by boot on a clean resume)
 
     def feed_bar(self, data: dict) -> Event:
         """Publish a BAR event onto the shared bus (the fast loop's hot-path input).
@@ -204,10 +205,68 @@ def _breaker_event_factory(etype, data: dict, ts_utc):
 # --------------------------------------------------------------------------- #
 # boot — ON-BOOT RECOVERY FIRST, then (only on resume) start trading           #
 # --------------------------------------------------------------------------- #
+def start_watchdog(
+    system: System,
+    *,
+    heartbeat_timeout: float = 15.0,
+    dms_timeout: float = 30.0,
+    poll_interval: float = 1.0,
+    clock: Callable[[], datetime] | None = None,
+):
+    """Construct + ARM the in-process watchdog handle for this System (MASTER_PLAN §7).
+
+    The watchdog is conceptually an INDEPENDENT process (``python -m
+    orchestrator.watchdog`` — a launchd job; see scripts/cron/). This thin hook
+    builds a :class:`orchestrator.watchdog.Watchdog` wired to THIS system's bus,
+    OrderBook and venue so boot can (a) ARM the dead-man's switch — satisfying
+    ``OrderBook.assert_dead_mans_switch_armed`` — and (b) optionally drive
+    ``check()`` in-process for paper. In production prefer the standalone process
+    (it survives an engine hang). Returns the armed Watchdog.
+
+    Connectivity is simulated in paper. Heartbeats are read from the durable
+    events log (the engine publishes HEARTBEAT onto the same bus).
+    """
+    from orchestrator.dead_mans_switch import make_cancel_fn, make_flatten_fn
+    from orchestrator.watchdog import (
+        Watchdog,
+        heartbeat_from_connection,
+        heartbeat_from_events_db,
+        simulated_connectivity,
+    )
+
+    # Reuse the bus's own connection for the heartbeat read (DuckDB forbids a 2nd
+    # connection to the same file with a different config in-process). In prod the
+    # watchdog runs as its OWN process (python -m orchestrator.watchdog).
+    heartbeat_source = (
+        heartbeat_from_connection(system.bus._con)
+        if hasattr(system.bus, "_con")
+        else heartbeat_from_events_db(getattr(system.bus, "db_path", "events.duckdb"))
+    )
+
+    wd = Watchdog(
+        bus=system.bus,
+        heartbeat_source=heartbeat_source,
+        connectivity=simulated_connectivity,
+        positions_source=system.orderbook.open_positions,
+        working_orders_source=system.orderbook.open_orders,
+        flatten_fn=make_flatten_fn(system.orderbook, system.venue,
+                                   clock or (lambda: datetime.now(timezone.utc))),
+        cancel_fn=make_cancel_fn(system.venue),
+        limits=system.limits,
+        ri=system.breakers.ri if hasattr(system.breakers, "ri") else system.limits.default_ri,
+        heartbeat_timeout=heartbeat_timeout,
+        dms_timeout=dms_timeout,
+        poll_interval=poll_interval,
+        clock=clock,
+    ).arm()
+    return wd
+
+
 def boot(
     system: System,
     *,
     dead_mans_switch_armed: bool = True,
+    start_watchdog_hook: bool = True,
 ) -> System:
     """Resilient boot sequence (MASTER_PLAN §7). RECONCILE RUNS FIRST.
 
@@ -220,10 +279,12 @@ def boot(
          CIRCUIT_BREAKER_TRIPPED emitted by reconcile already latched the gateway.
       3. Also refuse to resume if the breaker service reports a HARD program halt
          (a -35%-from-peak halt requires a manual restart, not an auto-boot).
-      4. On a clean resume, arm the local-OCO dead-man's-switch assertion, wire
-         the fast loop's subscriptions, and start the loop.
+      4. On a clean resume, START THE WATCHDOG (arming the dead-man's switch),
+         arm the local-OCO dead-man's-switch assertion, wire the fast loop's
+         subscriptions, and start the loop — watchdog up BEFORE new orders.
 
-    Returns the same :class:`System` with ``started`` / ``halted_on_boot`` set.
+    Returns the same :class:`System` with ``started`` / ``halted_on_boot`` set and
+    ``system.watchdog`` populated on a clean resume.
     """
     # 1) ON-BOOT RECOVERY — FIRST, before any new order.
     result = reconcile(system.bus, system.orderbook, system.venue)
@@ -249,12 +310,19 @@ def boot(
         )
         return system
 
-    # 4) Clean resume. Local OCO brackets require the dead-man's switch in
-    #    production (watchdog.py, P6); refuse to run live with local brackets
-    #    unless it is armed. Paper passes armed=True.
-    system.orderbook.assert_dead_mans_switch_armed(dead_mans_switch_armed)
+    # 4) Clean resume. START THE WATCHDOG FIRST (independent §7 monitor), which
+    #    ARMS the dead-man's switch. Local OCO brackets require the switch armed
+    #    in production (watchdog.py); the armed watchdog satisfies that
+    #    requirement so the assertion below passes.
+    if start_watchdog_hook:
+        system.watchdog = start_watchdog(system)
+        armed = dead_mans_switch_armed or system.watchdog.armed
+    else:
+        armed = dead_mans_switch_armed
+    system.orderbook.assert_dead_mans_switch_armed(armed)
 
-    # Wire the deterministic fast loop onto the shared bus and start it.
+    # Wire the deterministic fast loop onto the shared bus and start it (only
+    # AFTER the watchdog is up — new orders are not enabled before the monitor).
     system.fast_loop.start()
     system.started = True
     system.halted_on_boot = False
