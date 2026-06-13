@@ -314,6 +314,155 @@ def correlation_heatmap(
 
 
 # --------------------------------------------------------------------------- #
+# Per-trade chart (the journalist's chart PNG, MASTER_PLAN §4)
+# --------------------------------------------------------------------------- #
+def trade_chart(
+    bars,
+    out_path: str | Path,
+    *,
+    title: str = "trade",
+    levels: dict | None = None,
+    entry: dict | None = None,
+    exit: dict | None = None,
+    stop: float | None = None,
+    target: float | None = None,
+) -> str:
+    """Render a per-trade candle chart with levels + fill markers; return path.
+
+    The journalist's chart (MASTER_PLAN §4): the session's price candles, the
+    strategy levels (PDH/PDL/PMH/PML), the planned stop/target, and the entry /
+    exit fill markers, all on one headless (Agg) PNG.
+
+    Args:
+        bars: the session OHLC bars. Either a pandas DataFrame with columns
+            ``open/high/low/close`` (optionally ``ts_utc``) or a list of dicts
+            with those keys. An empty/None ``bars`` still renders a valid PNG
+            (levels + markers only) so a chart is always produced.
+        out_path: where to write the PNG.
+        title: figure title (e.g. ``"QQQ breakout_retest 2026-06-01"``).
+        levels: optional dict of horizontal levels to draw, e.g.
+            ``{"PDH": 101.2, "PDL": 99.1, "PMH": ..., "PML": ...}`` — any subset.
+        entry: optional ``{"price": float, "index": int|None}`` entry-fill marker.
+        exit: optional ``{"price": float, "index": int|None}`` exit-fill marker.
+        stop / target: optional planned protective/target price lines.
+
+    Returns:
+        The output path (str).
+    """
+    out = _ensure_parent(out_path)
+
+    # ---- normalize bars to numpy OHLC arrays ----
+    o = h = l = c = np.asarray([], dtype="float64")
+    n = 0
+    if bars is not None:
+        if isinstance(bars, pd.DataFrame):
+            if len(bars):
+                o = bars["open"].to_numpy(dtype="float64")
+                h = bars["high"].to_numpy(dtype="float64")
+                l = bars["low"].to_numpy(dtype="float64")
+                c = bars["close"].to_numpy(dtype="float64")
+        else:
+            rows = list(bars)
+            if rows:
+                o = np.asarray([float(r["open"]) for r in rows], dtype="float64")
+                h = np.asarray([float(r["high"]) for r in rows], dtype="float64")
+                l = np.asarray([float(r["low"]) for r in rows], dtype="float64")
+                c = np.asarray([float(r["close"]) for r in rows], dtype="float64")
+        n = len(c)
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+
+    # ---- candles ----
+    for i in range(n):
+        color = "#2ca02c" if c[i] >= o[i] else "#d62728"
+        # wick
+        ax.plot([i, i], [l[i], h[i]], color=color, lw=0.8, zorder=2)
+        # body
+        lo, hi = min(o[i], c[i]), max(o[i], c[i])
+        ax.add_patch(
+            plt.Rectangle(
+                (i - 0.3, lo), 0.6, max(hi - lo, 1e-9),
+                facecolor=color, edgecolor=color, lw=0.5, zorder=3, alpha=0.9,
+            )
+        )
+
+    # ---- horizontal strategy levels ----
+    level_colors = {
+        "PDH": "#1f77b4", "PDL": "#1f77b4",
+        "PMH": "#9467bd", "PML": "#9467bd",
+    }
+    if levels:
+        for name, price in levels.items():
+            if price is None:
+                continue
+            col = level_colors.get(str(name).upper(), "#7f7f7f")
+            ax.axhline(float(price), color=col, lw=1.0, ls="--", alpha=0.7, zorder=1)
+            ax.text(0.002, float(price), f" {name}", color=col, fontsize=8,
+                    va="bottom", ha="left", transform=ax.get_yaxis_transform())
+
+    # ---- planned stop / target lines ----
+    if stop is not None:
+        ax.axhline(float(stop), color="#d62728", lw=1.1, ls=":", alpha=0.8, zorder=1)
+        ax.text(0.998, float(stop), "stop ", color="#d62728", fontsize=8,
+                va="bottom", ha="right", transform=ax.get_yaxis_transform())
+    if target is not None:
+        ax.axhline(float(target), color="#2ca02c", lw=1.1, ls=":", alpha=0.8, zorder=1)
+        ax.text(0.998, float(target), "target ", color="#2ca02c", fontsize=8,
+                va="bottom", ha="right", transform=ax.get_yaxis_transform())
+
+    # ---- entry / exit fill markers ----
+    def _xy(marker, default_idx):
+        if not marker or marker.get("price") is None:
+            return None
+        idx = marker.get("index")
+        if idx is None:
+            idx = default_idx
+        # Clamp into the drawable range so markers always land on the axes.
+        if n:
+            idx = max(0, min(int(idx), n - 1))
+        else:
+            idx = 0
+        return (idx, float(marker["price"]))
+
+    ex = _xy(entry, 0)
+    xx = _xy(exit, (n - 1) if n else 0)
+    if ex is not None:
+        ax.scatter([ex[0]], [ex[1]], marker="^", s=140, color="#0b6e0b",
+                   edgecolor="white", lw=0.8, zorder=5, label="entry")
+        ax.annotate(f"entry {ex[1]:.2f}", ex, textcoords="offset points",
+                    xytext=(6, 8), fontsize=8, color="#0b6e0b")
+    if xx is not None:
+        ax.scatter([xx[0]], [xx[1]], marker="v", s=140, color="#7a0b0b",
+                   edgecolor="white", lw=0.8, zorder=5, label="exit")
+        ax.annotate(f"exit {xx[1]:.2f}", xx, textcoords="offset points",
+                    xytext=(6, -12), fontsize=8, color="#7a0b0b")
+
+    # If there are no bars, set a sane y-range from whatever prices we have.
+    if n == 0:
+        ys = [v for v in (
+            stop, target,
+            ex[1] if ex else None, xx[1] if xx else None,
+            *([float(p) for p in levels.values() if p is not None] if levels else []),
+        ) if v is not None]
+        if ys:
+            lo, hi = min(ys), max(ys)
+            pad = max((hi - lo) * 0.1, 0.5)
+            ax.set_ylim(lo - pad, hi + pad)
+        ax.set_xlim(-1, 1)
+
+    ax.set_title(title, fontsize=12, fontweight="bold", loc="left")
+    ax.set_xlabel("bar index (session)")
+    ax.set_ylabel("price")
+    ax.grid(alpha=0.25)
+    if ex is not None or xx is not None:
+        ax.legend(fontsize=8, loc="best")
+
+    fig.savefig(out, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return str(out)
+
+
+# --------------------------------------------------------------------------- #
 # Blend vs singles (the maximization chart)
 # --------------------------------------------------------------------------- #
 def blend_vs_singles(

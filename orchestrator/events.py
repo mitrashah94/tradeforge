@@ -61,6 +61,13 @@ class EventType(str, Enum):
     VOL_SPIKE = "VOL_SPIKE"
     DATA_ANOMALY = "DATA_ANOMALY"
 
+    # --- Slow-loop policy (LLM-overseen, deterministic compute) ---
+    # Published once per session by the regime-reader (orchestrator/agents/
+    # regime_reader.py): the daily regime/vol read + armed strategies + the
+    # exposure scalar the fast-loop sizing consumes. See MASTER_PLAN.md §1
+    # (regime-scaled exposure) and §4 (slow-loop agents).
+    REGIME_TAGGED = "REGIME_TAGGED"
+
     # --- Strategy / growth ---
     STRATEGY_DEMOTED = "STRATEGY_DEMOTED"
     MILESTONE_REACHED = "MILESTONE_REACHED"

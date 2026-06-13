@@ -1,7 +1,21 @@
 # watchlist/criteria.yaml — universe selection criteria. Tiers: CORE (live), ACTIVE (paper), SCOUT (observe).
+#
+# Each tier has liquidity/price gates AND a per-strategy level-respect gate
+# (require_score): a symbol earns a tier only if its best level-respect score
+# (the ~90-day replay mini-backtest, watchlist/level_respect.py) clears the gate.
+# CORE additionally passes a CORRELATION CHECK (require_correlation_check): a
+# candidate is admitted to CORE only if its daily-return correlation to every
+# current CORE member is below core_max_correlation — so CORE stays genuinely
+# diversified (don't fill it with three SPY proxies; MASTER_PLAN.md §4).
 tiers:
-  CORE:   {max_symbols: 4,  min_dollar_volume: 50000000, min_price: 5}
-  ACTIVE: {max_symbols: 8,  min_dollar_volume: 20000000, min_price: 3}
-  SCOUT:  {max_symbols: 25, min_dollar_volume: 5000000,  min_price: 1}
-require_level_respect_score: 0.0   # per-strategy fit gate (set per strategy later)
+  CORE:   {max_symbols: 4,  min_dollar_volume: 50000000, min_price: 5, require_score: 0.55}
+  ACTIVE: {max_symbols: 8,  min_dollar_volume: 20000000, min_price: 3, require_score: 0.45}
+  SCOUT:  {max_symbols: 25, min_dollar_volume: 5000000,  min_price: 1, require_score: 0.0}
+
+# Fallback per-strategy fit gate if a tier omits require_score.
+require_level_respect_score: 0.0
+
+# CORE diversification: reject a CORE candidate whose daily-return correlation to
+# any existing CORE member exceeds this threshold.
 require_correlation_check: true
+core_max_correlation: 0.85
