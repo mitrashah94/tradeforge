@@ -1,0 +1,76 @@
+# backtest/costs.yaml — named cost profiles for the backtest engine.
+#
+# Two profiles (MASTER_PLAN.md §5 — "realistic small-account cost model"):
+#
+#   tv_style  — matches the TradingView Pine strategy that produced the
+#               reference PF (commission $1/order, slippage 1 tick = $0.01,
+#               half_spread $0). Used for the V0 reproduction GATE so the
+#               comparison is apples-to-apples with the Pine result.
+#
+#   realistic — honest small-account frictions. Equity is zero-commission
+#               (Robinhood/Alpaca), pays the 1-cent QQQ half-spread and a
+#               1-tick slippage on adverse (market/stop) fills. Crypto and
+#               option params are placeholders for later stages (documented
+#               but not exercised by the V0 gate, which is equity-only).
+#
+# Application semantics (see backtest/engine/cost.py):
+#   - Entry (market) and STOP fills slip ADVERSELY by (half_spread + slippage):
+#     longs buy higher / sell lower, shorts sell lower / buy higher.
+#   - LIMIT / TARGET fills are resting limit orders: they pay half_spread but
+#     NO slippage (you do not cross the spread adversely on a resting limit).
+#   - commission is cash per order (charged on entry and on exit = 2x/trade
+#     for a round trip).
+#
+# Units: half_spread and slippage may be given in absolute price units
+# (key suffix _price) OR basis points of the reference price (suffix _bps).
+# Exactly one of each pair should be set per asset_class; the other null.
+
+profiles:
+  tv_style:
+    description: >-
+      Mirrors the TradingView Pine strategy costs for the PF reproduction gate.
+    equity:
+      commission_per_order: 1.0
+      half_spread_price: 0.0
+      half_spread_bps: null
+      slippage_price: 0.01      # 1 tick
+      slippage_bps: null
+    crypto:
+      commission_per_order: 0.0
+      half_spread_price: null
+      half_spread_bps: 0.0
+      slippage_price: null
+      slippage_bps: 0.0
+    option:
+      commission_per_order: 0.0
+      half_spread_price: 0.0
+      half_spread_bps: null
+      slippage_price: 0.0
+      slippage_bps: null
+
+  realistic:
+    description: >-
+      Honest small-account frictions (§5): zero-commission equity with a
+      1-cent QQQ spread + 1-tick slippage; wide crypto spreads; per-contract
+      option placeholder.
+    equity:
+      commission_per_order: 0.0   # Robinhood/Alpaca zero-commission equities
+      half_spread_price: 0.005    # 1-cent round QQQ spread -> 0.5c per side
+      half_spread_bps: null
+      slippage_price: 0.01        # 1 tick adverse on market/stop fills
+      slippage_bps: null
+    crypto:
+      commission_per_order: 0.0
+      half_spread_price: null
+      half_spread_bps: 25.0       # wide Robinhood crypto spread (their revenue)
+      slippage_price: null
+      slippage_bps: 5.0
+    option:
+      # Per-contract spread placeholder; options track is NOT built in Stage 1.
+      # Modeled as an absolute per-share half_spread stand-in ($5/contract on a
+      # 100-multiplier contract ~= $0.05/share); documented as a placeholder.
+      commission_per_order: 0.0
+      half_spread_price: 0.05
+      half_spread_bps: null
+      slippage_price: 0.0
+      slippage_bps: null

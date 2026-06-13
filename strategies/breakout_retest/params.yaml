@@ -1,0 +1,53 @@
+# strategies/breakout_retest/params.yaml — sweepable parameters for the
+# PDH/PDL continuation strategy (the PF-2.24 baseline) and the V0..V4 ablation
+# variant deltas (MASTER_PLAN.md §5). Only V0 is run in Stage 1.
+#
+# V0 defaults below reproduce the TradingView Pine config
+#   Entry Type = "B: Retest", Target = "Fixed 2R", QQQ 5m.
+
+defaults:
+  # ---- core (active in V0) ----
+  entry_type: retest          # break | retest   (V0 = retest)
+  target_mode: fixed_2r       # fixed_2r | trailing   (V0 = fixed_2r)
+  break_confirm: close        # break confirmed when the bar CLOSES beyond level
+  retest_window_min: 2        # retest valid in bars_since_break in [min, max]
+  retest_window_max: 7
+  stop_buffer_ticks: 1        # stop = level -/+ (stop_buffer_ticks * tick)
+  r_multiple: 2.0             # fixed target = signal_close +/- r_multiple * risk
+  tick: 0.01                  # QQQ/SPY tick size
+  levels: [pdh, pdl]          # which levels arm break detection (V0 = PDH/PDL)
+
+  # ---- ablation hooks (RESERVED — params present, logic added in later stages) ----
+  ntz_filter: false           # V1: no entries inside the No-Trade Zone
+  use_pmh_pml: false          # V2: also arm breaks on PMH/PML
+  partial_runner: false       # V3: scale out a partial at TP1, trail a runner
+  partial_tp1_r: 1.0          # R multiple for the partial (V3)
+  partial_fraction: 0.5       # fraction of size taken at TP1 (V3)
+  trail_mode: prior_bar       # trailing reference for target_mode=trailing/runner
+  battle_zone_atr: 0.15       # level +/- battle_zone_atr * ATR (reserved, §5)
+  break_buffer_atr: 0.0       # require close beyond level by this * ATR (reserved)
+
+# Named ablation variants. Each lists ONLY its delta from `defaults`.
+# Stage 1 runs V0 exclusively; the rest are declared so params.yaml is complete.
+variants:
+  V0:                          # retest + fixed_2R + PDH/PDL only  (the gate)
+    {}                         # == defaults
+  V1:                          # + NTZ no-trade filter
+    ntz_filter: true
+  V2:                          # + PMH/PML levels
+    ntz_filter: true
+    use_pmh_pml: true
+    levels: [pdh, pdl, pmh, pml]
+  V3:                          # + partial + runner exit structure
+    ntz_filter: true
+    use_pmh_pml: true
+    levels: [pdh, pdl, pmh, pml]
+    partial_runner: true
+    target_mode: trailing
+  V4:                          # full playbook
+    ntz_filter: true
+    use_pmh_pml: true
+    levels: [pdh, pdl, pmh, pml]
+    partial_runner: true
+    target_mode: trailing
+    break_buffer_atr: 0.05
