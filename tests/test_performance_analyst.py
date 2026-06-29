@@ -28,7 +28,25 @@ from orchestrator.agents.performance_analyst import (
     rolling_profit_factor,
     spy_buy_and_hold_return,
 )
-from risk.config import load_limits
+from risk.config import Ratchet, load_limits
+
+
+def _limits_no_sweep_gate(starting_capital: float = 1000.0):
+    """Real ``Limits`` with the early-game no-sweep gate OFF (sweep_threshold=0).
+
+    The operator may activate the no-sweep-below-$10k gate in risk/limits.yaml;
+    the milestone-MATH tests pin the unconditional ``0.25 × gain`` sweep, so they
+    swap in a ratchet whose ``sweep_threshold`` is 0 to stay independent of that
+    operator tuning.
+    """
+    base = load_limits()
+    ratchet = Ratchet(
+        starting_capital=starting_capital,
+        sweep_fraction=0.25,
+        milestones=[2500, 5000, 10000, 25000, 50000, 100000],
+        vault_sleeve="vault",
+    )
+    return base.model_copy(update={"ratchet": ratchet})
 
 
 # --------------------------------------------------------------------------- #
@@ -178,6 +196,30 @@ def test_after_tax_equity_curve_reserves_running_gain():
     assert curve[2] == pytest.approx(1100.0 - 0.25 * 100.0)  # 1075
 
 
+def test_tax_reserve_contract_matches_daily_engine():
+    """Pin the documented cross-module after-tax contract (engine vs analyst).
+
+    Both reservers must share the same default rate and the same gains-only,
+    floored-at-0 sign rule. See the ``after_tax_equity`` docstring CONTRACT note.
+    """
+    from orchestrator.agents.performance_analyst import DEFAULT_TAX_RESERVE_RATE
+    from backtest.daily.engine import DEFAULT_SHORT_TERM_TAX_RATE
+
+    # Same blunt default reserve rate on both sides.
+    assert DEFAULT_TAX_RESERVE_RATE == DEFAULT_SHORT_TERM_TAX_RATE == 0.30
+
+    # Gains-only: a net-up period reserves rate * net gain.
+    up = after_tax_equity([300.0, -100.0], starting_capital=1000.0, tax_reserve_rate=0.30)
+    assert up["realized_gain"] == pytest.approx(200.0)
+    assert up["tax_reserve"] == pytest.approx(60.0)  # 0.30 * 200
+
+    # Floored at 0: a net-down period reserves nothing and never refunds.
+    down = after_tax_equity([100.0, -300.0], starting_capital=1000.0, tax_reserve_rate=0.30)
+    assert down["realized_gain"] == pytest.approx(-200.0)
+    assert down["tax_reserve"] == 0.0
+    assert down["aftertax_equity"] == pytest.approx(down["pretax_equity"])
+
+
 # --------------------------------------------------------------------------- #
 # 5. Paper-vs-backtest reconciliation — flags drift
 # --------------------------------------------------------------------------- #
@@ -257,7 +299,8 @@ def test_no_demotion_when_pf_healthy():
 # --------------------------------------------------------------------------- #
 def test_milestone_emits_reached_and_sweep_with_correct_math():
     bus = FakeBus()
-    pa = PerformanceAnalyst(bus=bus, starting_capital=1000.0)
+    limits = _limits_no_sweep_gate(starting_capital=1000.0)
+    pa = PerformanceAnalyst(bus=bus, limits=limits, starting_capital=1000.0)
     # Drive equity 1000 -> 2600 (crosses the 2500 milestone) in one trade.
     pa.record_trade(1600.0, strategy="breakout_retest")
 
@@ -279,7 +322,8 @@ def test_milestone_emits_reached_and_sweep_with_correct_math():
 
 def test_milestone_does_not_double_sweep():
     bus = FakeBus()
-    pa = PerformanceAnalyst(bus=bus, starting_capital=1000.0)
+    limits = _limits_no_sweep_gate(starting_capital=1000.0)
+    pa = PerformanceAnalyst(bus=bus, limits=limits, starting_capital=1000.0)
     pa.record_trade(1600.0, strategy="s")  # 1000 -> 2600, crosses 2500
     # Another gain that stays below the NEXT milestone (5000) must not re-sweep.
     pa.record_trade(300.0, strategy="s")  # 2600 -> 2900
@@ -289,13 +333,43 @@ def test_milestone_does_not_double_sweep():
 
 def test_milestone_via_position_closed_event():
     bus = FakeBus()
-    pa = PerformanceAnalyst(bus=bus, starting_capital=1000.0)
+    limits = _limits_no_sweep_gate(starting_capital=1000.0)
+    pa = PerformanceAnalyst(bus=bus, limits=limits, starting_capital=1000.0)
     pa.on_position_closed(
         Event(type=EventType.POSITION_CLOSED,
               data={"symbol": "SPY", "realized_pnl": 1600.0, "strategy": "s"})
     )
     assert len(bus.of_type(EventType.RATCHET_SWEEP)) == 1
     assert bus.of_type(EventType.RATCHET_SWEEP)[0].data["sweep_amount"] == pytest.approx(400.0)
+
+
+def test_milestone_below_sweep_threshold_checkpoints_zero_sweep():
+    """With the early-game gate ON, crossing a milestone BELOW the threshold is a
+    checkpoint: MILESTONE_REACHED fires, RATCHET_SWEEP carries sweep_amount 0, the
+    baseline advances, and the vault stays empty (early gains fully compound)."""
+    bus = FakeBus()
+    base = load_limits()
+    gated = Ratchet(
+        starting_capital=1000.0,
+        sweep_fraction=0.25,
+        milestones=[2500, 5000, 10000, 25000, 50000, 100000],
+        vault_sleeve="vault",
+        sweep_threshold=10000,
+        vault_below_threshold=0,
+    )
+    limits = base.model_copy(update={"ratchet": gated})
+    pa = PerformanceAnalyst(bus=bus, limits=limits, starting_capital=1000.0)
+    pa.record_trade(1600.0, strategy="s")  # 1000 -> 2600, crosses 2500 (< 10k)
+
+    reached = bus.of_type(EventType.MILESTONE_REACHED)
+    swept = bus.of_type(EventType.RATCHET_SWEEP)
+    assert len(reached) == 1 and len(swept) == 1
+    assert swept[0].data["milestone"] == 2500
+    assert swept[0].data["sweep_amount"] == pytest.approx(0.0)
+    assert swept[0].data["new_baseline"] == 2500
+    assert swept[0].data["vault_balance"] == pytest.approx(0.0)
+    assert pa.baseline == 2500
+    assert pa.vault_balance == pytest.approx(0.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -349,8 +423,12 @@ def test_summary_assembles_headline_metrics():
 
     assert s["equity"] == pytest.approx(1040.0)
     assert 0.0 <= s["risk_of_ruin"] <= 1.0
-    # RI floor is 5 -> per-trade 1.0% -> risk_fraction 0.01.
-    assert s["risk_fraction"] == pytest.approx(0.01)
+    # risk_fraction tracks the YAML's default RI row's per_trade_pct/100,
+    # whatever the operator has the floor set to (RI 5 -> 0.01, RI 6 -> 0.0125).
+    limits = load_limits()
+    expected_rf = limits.level(limits.default_ri).per_trade_pct / 100.0
+    assert s["risk_fraction"] == pytest.approx(expected_rf)
+    assert s["ri"] == limits.default_ri
     # after-tax equity is below pretax (a net gain was made).
     assert s["after_tax"]["aftertax_equity"] < s["after_tax"]["pretax_equity"]
     # eod_report is the alias the journalist calls.
@@ -400,8 +478,10 @@ def test_firewall_no_writes_to_limits_or_registry(tmp_path, monkeypatch):
 
 
 def test_analyst_uses_real_ratchet_config():
-    # The ratchet milestones/sweep come from the real limits.yaml (P0 reuse).
+    # The ratchet baseline/milestones/sweep come from the real limits.yaml (P0
+    # reuse). The starting capital is operator-tuned, so assert the analyst's
+    # baseline tracks the YAML rather than a hardcoded amount.
     limits = load_limits()
     pa = PerformanceAnalyst(bus=FakeBus())
-    assert pa.baseline == limits.ratchet.starting_capital == 1000
+    assert pa.baseline == limits.ratchet.starting_capital
     assert limits.ratchet.sweep_fraction == 0.25

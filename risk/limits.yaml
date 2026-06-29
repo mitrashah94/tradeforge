@@ -8,7 +8,7 @@ meta:
   per_trade_rule: "per_trade_$ = (per_trade_pct/100) * current_equity, recomputed each trade"
 
 risk_index:
-  default: 5            # current FLOOR; ramps toward 8 by manual, gated decision (never auto-tuned from live P&L)
+  default: 6            # current FLOOR; ramps toward 8 by manual, gated decision (never auto-tuned from live P&L)
   band: [5, 8]          # operating band; 1-4 and 9-10 are reference rows only
   table:
     1:  {per_trade_pct: 0.25, max_concurrent: 1, daily_halt_pct: 1.00, weekly_halt_pct: 3.0,  portfolio_heat_pct: 1.0, leverage_max: 1.0,  options: none,               reference_only: true}
@@ -31,9 +31,11 @@ conviction_tiers:
 # Milestone ratchet: at each milestone reached, sweep `sweep_fraction` of gains (vs the last
 # protected baseline) into a vault sleeve the aggressive engine cannot touch.
 ratchet:
-  starting_capital: 1000
+  starting_capital: 500            # was 1000; range is $500–$100k
   sweep_fraction: 0.25
-  milestones: [2500, 5000, 10000, 25000, 50000, 100000]
+  vault_below_threshold: 0         # NEW: no sweep below $10k — early gains fully compound
+  sweep_threshold: 10000           # NEW: 25% vault sweep starts at $10k
+  milestones: [1000, 2500, 5000, 10000, 25000, 50000, 100000]   # added 1000
   vault_sleeve: untouchable_by_aggressive_engine
 
 # Program-abort: NOT on the risk dial, always on. Insurance against bugs/disconnects/death-spirals.

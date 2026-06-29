@@ -28,12 +28,24 @@ class RiskLevel(BaseModel):
 
 
 class Ratchet(BaseModel):
-    """Milestone gain-ratchet configuration."""
+    """Milestone gain-ratchet configuration.
+
+    ``sweep_threshold`` / ``vault_below_threshold`` are OPTIONAL (default 0.0).
+    When ``sweep_threshold > 0`` they gate the early-game "no-sweep" regime: while
+    equity is below the threshold a crossed milestone is a CHECKPOINT (advance the
+    protected baseline, sweep nothing) so early gains fully compound; at/above the
+    threshold the normal ``sweep_fraction`` sweep applies. With neither key present
+    (both 0.0) behavior is identical to the original unconditional-sweep ratchet.
+    ``vault_below_threshold`` is reserved for a future partial below-threshold
+    sweep rate; today it is parsed-but-unused (kept 0.0 -> sweep nothing below).
+    """
 
     starting_capital: float
     sweep_fraction: float
     milestones: list[float]
     vault_sleeve: str
+    sweep_threshold: float = 0.0
+    vault_below_threshold: float = 0.0
 
 
 class ProgramAbort(BaseModel):

@@ -333,6 +333,29 @@ def after_tax_equity(
       * ``tax_reserve``     — ``rate * max(0, realized_gain)``.
       * ``aftertax_equity`` — ``pretax_equity - tax_reserve``.
       * ``tax_reserve_rate``.
+
+    CONTRACT — consistency with the daily backtester (backtest/daily/engine.py).
+    -----------------------------------------------------------------------------
+    Both reservers model the SAME tax policy and must stay aligned:
+      * Same default rate: ``DEFAULT_TAX_RESERVE_RATE`` here ==
+        ``backtest.daily.engine.DEFAULT_SHORT_TERM_TAX_RATE`` (0.30). The real
+        number is the user's marginal bracket; this is a blunt reserve, not advice.
+      * Same sign rule: a reserve accrues only on POSITIVE net realized gains and
+        is FLOORED AT 0 (a net-loss period reserves nothing; there is never a
+        refund / negative reserve).
+      * Same headline: ``after-tax = pretax_nav − running_tax_reserve``, and
+        compounding/CAGR are reported on after-tax dollars.
+    The one DELIBERATE difference is the offset granularity. This trade-ledger
+    view nets ALL pnls in the period first, then reserves on the single net
+    figure (``max(0, Σpnl)``) — so within a call a loss fully offsets an earlier
+    gain. The daily engine accrues the reserve PER REBALANCE on the running
+    realized-gain total (losses bank an offset against that running total, never
+    below 0), so an interim gain followed by a later loss can leave a residual
+    reserve the engine never refunds — the conservative ledger behavior. Over a
+    full period that ends net-up by the same total, both converge; the engine is
+    simply more conservative on the path. Neither models wash sales or carry-
+    forwards. Keep the rate and the gains-only/floor-at-0 rule identical here and
+    in the engine if either is ever changed.
     """
     pnls = _to_array(trade_pnls)
     realized = float(pnls.sum()) if pnls.size else 0.0
