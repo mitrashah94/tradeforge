@@ -71,6 +71,8 @@ EVT_PRICE_CROSS_LEVEL = "PRICE_CROSS_LEVEL"
 EVT_ORDER_INTENT = "ORDER_INTENT"
 EVT_ORDER_FILLED = "ORDER_FILLED"
 EVT_ORDER_PARTIAL = "ORDER_PARTIAL"
+EVT_ORDER_VETOED = "ORDER_VETOED"
+EVT_ORDER_REJECTED = "ORDER_REJECTED"
 EVT_POSITION_CLOSED = "POSITION_CLOSED"
 EVT_TP1_HIT = "TP1_HIT"
 EVT_STOP_HIT = "STOP_HIT"
@@ -291,6 +293,7 @@ class FastLoop:
         self.bus.subscribe([EVT_BAR, EVT_PRICE_CROSS_LEVEL], self._on_bar_event)
         self.bus.subscribe([EVT_ORDER_FILLED], self._on_order_filled)
         self.bus.subscribe([EVT_ORDER_PARTIAL], self._on_order_partial)
+        self.bus.subscribe([EVT_ORDER_VETOED, EVT_ORDER_REJECTED], self._on_entry_rejected)
         self.bus.subscribe([EVT_POSITION_CLOSED], self._on_position_closed)
         self.bus.subscribe([EVT_CIRCUIT_BREAKER_TRIPPED], self._on_circuit_breaker)
         self.bus.subscribe([EVT_NO_TRADE_WINDOW], self._on_no_trade_window)
@@ -537,6 +540,27 @@ class FastLoop:
                 return
             self._lifecycle.on_position_closed()
             self._reset_position()
+        finally:
+            self.latency.record((time.perf_counter() - t0) * 1000.0)
+
+    def _on_entry_rejected(self, event) -> None:
+        """Free the single slot when our PENDING entry is vetoed/rejected.
+
+        ``_request_entry`` stands up ``_managed`` (OPEN_PENDING) BEFORE publishing
+        the entry intent. If the gateway then VETOES (risk/halt) or the venue
+        REJECTS that intent, no ORDER_FILLED ever arrives — so without this the
+        slot would stay OPEN_PENDING forever and block every future entry. We
+        reset only when the event matches our pending (unfilled) entry's
+        client_id, so an already-filled position is never clobbered.
+        """
+        t0 = time.perf_counter()
+        try:
+            if self._managed is None or self._managed.filled:
+                return
+            data = _event_data(event)
+            cid = data.get("client_id")
+            if cid is None or cid == self._managed.client_id:
+                self._reset_position()
         finally:
             self.latency.record((time.perf_counter() - t0) * 1000.0)
 

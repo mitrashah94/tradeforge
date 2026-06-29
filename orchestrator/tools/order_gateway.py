@@ -153,6 +153,18 @@ class OrderGateway:
             self._halted = False
             self._halt_reason = ""
 
+    def resume(self) -> None:
+        """Clear the halt latch (the deterministic 'resume trading' action).
+
+        Intended for the premarket DAILY RESET (workflows/premarket.py): an
+        intraday cooldown / scoped daily halt stands trading down for the session,
+        and the next session resumes after the breaker service has rolled its
+        period / cleared the cooldown. The caller is responsible for NOT resuming
+        through a hard program halt (it gates on ``breakers.is_program_halted()``).
+        """
+        self._halted = False
+        self._halt_reason = ""
+
     def _limits_obj(self):
         if self._limits is None:
             from risk.config import load_limits  # lazy
@@ -229,7 +241,10 @@ class OrderGateway:
             if equity is not None and order_notional is not None and stop_distance_pct is not None:
                 trade_risk = float(order_notional) * float(stop_distance_pct)
                 cap = per_trade_dollar_risk(float(equity), ri, limits)
-                if trade_risk > cap:
+                # Tolerance: vol-target sizing computes qty so trade_risk == cap
+                # exactly; a strict ``>`` would reject on floating-point noise
+                # (e.g. 1250.0000001 > 1250.0). Allow equality within 1e-9 rel.
+                if trade_risk > cap * (1.0 + 1e-9) + 1e-9:
                     return (f"per-trade risk {trade_risk:.2f} exceeds cap "
                             f"{cap:.2f} at RI {ri}")
 

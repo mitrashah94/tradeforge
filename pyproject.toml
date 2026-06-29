@@ -10,6 +10,7 @@ dependencies = [
   "pyarrow>=15.0",
   "vectorbt>=0.26",
   "alpaca-py>=0.20",
+  "polygon-api-client>=1.14",
   "pydantic>=2.5",
   "pyyaml>=6.0",
   "rich>=13.0",
