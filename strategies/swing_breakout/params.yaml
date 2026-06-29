@@ -1,0 +1,59 @@
+# strategies/swing_breakout/params.yaml — sweepable parameters for the DAILY
+# DONCHIAN-BREAKOUT TREND sleeve (the long-only, multi-day breakout-in-uptrend
+# that the bracketed-swing engine then manages with an ATR stop + partial-TP +
+# chandelier trail). The classic turtle / Donchian breakout: BUY STRENGTH.
+#
+# HONEST FRAMING: trend breakouts have a LOW hit rate (failed breakouts, whipsaw)
+# and earn their keep on the fat right tail — a few trailed runners that pay for
+# many small losers. So the bracket plan (let-it-run trail vs a hard-target cap)
+# matters as much as the entry. The robustness sweep (vary stop/donchian/sma) is
+# what tells us the edge is a plateau, not an overfit spike.
+#
+# Two parameter blocks:
+#   * SIGNAL params (donchian_n / trend_sma / momentum_lookback / score_mode /
+#     exit_on_trend_break) are consumed by SwingBreakoutStrategy.
+#   * BRACKET + sizing params (atr_window .. risk_pct_per_trade) are the knobs the
+#     backtest driver feeds into BracketConfig / run_bracket_portfolio. They live
+#     here so the whole sleeve is configured in one file, but the STRATEGY object
+#     ignores them — the engine owns the bracket.
+
+defaults:
+  # ---- SIGNAL (consumed by SwingBreakoutStrategy) ----
+  donchian_n: 50              # fire on a fresh N-day-high breakout (channel ends YESTERDAY)
+  trend_sma: 100              # only buy breakouts ABOVE this trend SMA (the core risk gate)
+  momentum_lookback: 120      # trailing-return window for the ranking score (~6 months)
+  score_mode: momentum        # 'momentum' (trailing-return) | 'above_sma' (dist above SMA)
+  exit_on_trend_break: false  # let the ATR trail decide; true -> also exit on close < trend SMA
+
+  # ---- BRACKET (fed into BracketConfig by the driver) ----
+  atr_window: 14              # ATR lookback for the stop distance + chandelier band
+  stop_atr_mult: 2.5          # initial stop = entry - stop_atr_mult*ATR (the R basis)
+  tp1_R: 1.5                  # first partial target in R multiples (E + tp1_R*R)
+  tp1_fraction: 0.5           # scale out half at TP1, ratchet the runner to breakeven
+  trail_atr_mult: 3.0         # chandelier: stop = highest_high - trail_atr_mult*ATR_entry
+  use_trail: true             # let winners run on the chandelier trail (the default edge)
+  hard_target_R: null         # no upside cap by default (set + use_trail:false for a fixed bracket)
+
+  # ---- SIZING / breadth (fed into run_bracket_portfolio by the driver) ----
+  max_concurrent: 8           # max simultaneous open positions (free-slot budget)
+  risk_pct_per_trade: 0.01    # % of CURRENT equity risked per entry (RI 5 floor = 1.0%)
+
+# Named variant deltas (each lists ONLY its delta from `defaults`). DEFAULT is the
+# let-winners-run breakout; the rest probe what drives it (the bracket shape and
+# the stop width) for the honest "what beats buy&hold" read.
+variants:
+  DEFAULT:                     # 50/100 Donchian, partial-TP + breakeven + chandelier trail
+    {}
+  HARD_TARGET:                 # the capped "max gain sell": full TP at +4R, NO trail
+    tp1_fraction: 0.0
+    hard_target_R: 4.0
+    use_trail: false
+  TIGHT_STOP:                  # tighter 2.0 ATR stop (more trades stopped, smaller R risk)
+    stop_atr_mult: 2.0
+  WIDE_STOP:                   # wider 3.0 ATR stop (fewer whipsaws, larger R risk)
+    stop_atr_mult: 3.0
+  FAST_DONCHIAN:               # shorter 20d breakout (earlier, noisier entries)
+    donchian_n: 20
+    trend_sma: 100
+  TREND_EXIT:                  # also bail on a close back below the trend SMA
+    exit_on_trend_break: true
