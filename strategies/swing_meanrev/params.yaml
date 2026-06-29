@@ -1,0 +1,53 @@
+# strategies/swing_meanrev/params.yaml — sweepable parameters for the SWING
+# MEAN-REVERSION sleeve (the multi-day RSI(2)-oversold dip-buy on broad/sector
+# index ETFs). The classic Connors RSI(2) edge, gated by a 200d uptrend.
+#
+# HONEST FRAMING: this is a well-known, crowded retail edge (Connors/Larsson
+# "RSI(2)"). Expect a MODEST, possibly-decayed result — the value here is the
+# DECORRELATION it brings (it buys the dips a momentum/breakout sleeve sells),
+# not a standalone alpha monster. Parameters are the textbook band; the
+# robustness sweep (run_param_grid) is what tells us whether the edge is a
+# plateau or an overfit spike.
+#
+# ALL holds are MULTI-DAY (the daily engine never trades intraday). "in" -> the
+# name joins an equal-weight basket of qualifying oversold names; "out" -> cash.
+
+defaults:
+  # ---- signal periods ----
+  rsi_period: 2               # Connors RSI(2): the short-period oversold oscillator
+  ma_window: 5                # short MA the close must sit several % below (5/10d)
+
+  # ---- entry gates (ALL must hold to ARM a name) ----
+  sma_gate: 200               # only buy names trading ABOVE their 200d SMA (uptrend)
+  oversold: 10.0              # arm when RSI(2) < oversold  (textbook 5-10)
+  pct_below_ma: 0.0           # AND close <= ma * (1 - pct_below_ma)  (0 -> just RSI gate;
+                              #   set e.g. 0.02 to also require >=2% below the MA)
+
+  # ---- exit (a held name leaves the basket when ANY fires) ----
+  exit_rsi: 60.0              # exit on the bounce: RSI(2) back ABOVE this (50-70)
+  max_hold_days: 10           # time-stop: force-exit after this many trading days held
+
+  # ---- sizing / breadth ----
+  max_concurrent: 4           # cap the basket at N names (equal-weight the held set)
+  weight_cap: 1.0             # total invested fraction cap (<=1; remainder is cash)
+
+  # ---- the tradable universe (broad + a few liquid sector XL*) ----
+  # SPY/QQQ broad index + the most liquid sector ETFs. LONG-only index ETFs only
+  # (no single names) — the RSI(2) dip-buy is an INDEX edge; single-stock fades
+  # carry idiosyncratic gap risk this sleeve is not built to wear.
+  universe: [SPY, QQQ, XLK, XLF, XLE, XLV, XLY, XLI, XLP, XLU]
+
+# Named variant deltas (each lists ONLY its delta from `defaults`). DEFAULT is
+# the textbook config; the rest probe the obvious knobs for the robustness read.
+variants:
+  DEFAULT:                     # textbook RSI(2)<10, 5d MA, 200d gate, 10d stop
+    {}
+  STRICT:                      # tighter oversold + require 2% below the MA (fewer, deeper dips)
+    oversold: 5.0
+    pct_below_ma: 0.02
+  LOOSE:                       # looser oversold, longer MA reference
+    oversold: 15.0
+    ma_window: 10
+  FAST_EXIT:                   # bounce-exit earlier (RSI>50) + shorter time stop
+    exit_rsi: 50.0
+    max_hold_days: 5

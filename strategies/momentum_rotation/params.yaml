@@ -1,0 +1,100 @@
+# strategies/momentum_rotation/params.yaml — sweepable parameters for the
+# MOMENTUM / DUAL-MOMENTUM ROTATION sleeve (the slow, cross-asset, low-correlation
+# allocation edge that the daily Yahoo data layer exists to feed; MASTER_PLAN.md
+# §1.A/B edge-stacking, §5 complements).
+#
+# THREE STACKED, TREND-FILTERED COMPONENTS (each a long-only weight contributor):
+#
+#   1. GEM-lite dual momentum (sleeve weight `gem_weight`):
+#        RELATIVE: pick the stronger of US (SPY) vs ex-US (VXUS) by 12m total
+#          return. ABSOLUTE gate: hold the winner only if its OWN 12m return beats
+#          cash (BIL) OR it is above its 200d SMA — else route to bonds (BND/AGG).
+#        This is the canonical "Global Equities Momentum" core, trimmed to two
+#        risk assets + a safe asset; its job is lower-maxDD equity exposure.
+#
+#   2. Sector RS rotation (sleeve weight `sector_weight`):
+#        Rank the 11 SPDR sectors by a BLENDED 3/6/12m total return, hold the
+#        top-N equal-weight, and gate EACH held sector by its OWN 200d SMA — a
+#        sector below trend forfeits its slot to the safe asset. Cross-sectional
+#        relative strength + an absolute trend filter per name.
+#
+#   3. Vol-scaling overlay (applied to the COMBINED book):
+#        Scale gross exposure inversely to recent realized vol toward `vol_target`
+#        (annualized). Gross = clamp(vol_target / realized_vol, 0, max_leverage_*).
+#        Under the conservative defaults max gross is 1.0 (NO leverage) — the
+#        overlay only ever DE-risks (cuts exposure into cash) when vol runs hot.
+#
+# GROWTH LEVERS (RESEARCH — validate before live; DEFAULTS OFF / conservative):
+#   offensive_risk_off: when ON and the downtrend is STRONG (the gated asset is
+#     below its 200d SMA AND 12m momentum is negative), route that risk-OFF slot
+#     into a -1x INVERSE ETF (PSQ for the QQQ/tech side, SH for SPY, RWM small-cap)
+#     instead of bonds — profit from the decline rather than merely sidestep it.
+#     HONESTY: inverse ETFs bleed from daily-reset decay + short-term tax churn;
+#     they help only in sustained, low-whipsaw downtrends. OFF by default.
+#   leveraged_long: when ON and in a CONFIRMED strong uptrend (price > 200d SMA
+#     AND 12m momentum strongly positive), tilt the risk-ON slot to a 2x/3x LONG
+#     (QLD/TQQQ) for `lev_fraction` of that slot. HONESTY: 3x funds suffer
+#     volatility decay and brutal drawdowns; the trend filter mitigates but does
+#     not remove this. OFF by default.
+#
+# Long-only contract: every weight is a POSITIVE fraction of equity and the total
+# is clamped to <= 1 (the engine rejects a sum > 1; remainder is cash). Inverse
+# exposure is a POSITIVE weight on an inverse ETF, never a short.
+
+defaults:
+  # ---- universe roles (which tickers fill each slot) ----
+  us_asset: SPY               # GEM relative-momentum US leg
+  exus_asset: VXUS            # GEM relative-momentum ex-US leg
+  cash_asset: BIL             # absolute-momentum benchmark (the "is it beating cash" test)
+  safe_asset: BND             # risk-OFF destination (bonds) when a gate fails
+  sectors: [XLK, XLF, XLE, XLV, XLI, XLY, XLP, XLU, XLB, XLRE, XLC]  # 11 SPDR sectors
+
+  # ---- lookbacks (trading days; ~21/mo) ----
+  lookback_3m: 63             # 3-month total-return lookback
+  lookback_6m: 126            # 6-month
+  lookback_12m: 252           # 12-month (the GEM relative + absolute horizon)
+  blend_weights: [0.0, 0.5, 0.5]   # weights on [3m, 6m, 12m] for the sector RS blend
+  sma_window: 200             # 200-day SMA trend gate (both GEM and per-sector)
+
+  # ---- sleeve mixing + selection ----
+  gem_weight: 0.5             # fraction of the book in the GEM-lite dual-momentum core
+  sector_weight: 0.5          # fraction of the book in the sector RS rotation
+  top_n: 3                    # number of top-ranked sectors held (equal-weight)
+  abs_mom_use_sma: true       # absolute gate passes if 12m>cash OR price>200d SMA
+                              # (false -> require BOTH, the stricter gate)
+
+  # ---- vol-scaling overlay ----
+  vol_window: 20              # trading-day window for realized vol (~1 month)
+  vol_target: 0.12            # annualized vol target for the COMBINED book (12%)
+  max_leverage_off: 1.0       # gross cap when offensive levers OFF (1.0 = no leverage)
+  min_gross: 0.10             # floor on gross so a vol spike never fully cashes out
+
+  # ---- GROWTH LEVERS (RESEARCH; DEFAULT OFF) ----
+  offensive_risk_off: false   # ON -> risk-OFF slot goes to a -1x inverse ETF, not bonds
+  inverse_us: SH              # -1x S&P (SPY-side risk-off)
+  inverse_qqq: PSQ            # -1x Nasdaq-100 (tech/QQQ-side risk-off)
+  inverse_smallcap: RWM       # -1x Russell-2000 (small-cap risk-off)
+  leveraged_long: false       # ON -> risk-ON slot tilts into a 2x/3x long
+  lev_us: QLD                 # 2x S&P-like long  (paired with SPY uptrend)
+  lev_qqq: TQQQ               # 3x Nasdaq long    (paired with a strong QQQ-side uptrend)
+  lev_fraction: 0.5           # fraction of the risk-ON slot routed into the leveraged ETF
+  strong_mom_threshold: 0.10  # 12m total return above this = "strong" uptrend (lever gate)
+
+# Named variants. Each lists ONLY its delta from `defaults`.
+# DEFAULT is the conservative core the integration stage runs uniformly.
+variants:
+  DEFAULT:                    # trend-filtered core, bonds risk-off, NO leverage
+    {}                        # == defaults
+  OFFENSIVE_OFF_ON:           # growth lever (a): inverse ETF risk-off slot
+    offensive_risk_off: true
+  LEVERAGED_ON:               # growth lever (b): 2x/3x long tilt in strong uptrends
+    leveraged_long: true
+  BOTH_LEVERS_ON:             # both growth levers ON (max aggression — RESEARCH)
+    offensive_risk_off: true
+    leveraged_long: true
+  GEM_ONLY:                   # pure GEM-lite dual momentum (no sector sleeve)
+    gem_weight: 1.0
+    sector_weight: 0.0
+  SECTOR_ONLY:                # pure sector RS rotation (no GEM core)
+    gem_weight: 0.0
+    sector_weight: 1.0
