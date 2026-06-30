@@ -1,0 +1,8 @@
+checksum: af8aa40b2cc9cd10
+locked: true
+locked_on: '2026-06-29'
+note: swing_breakout locked OOS 2018-01-01..2026-06-26 - DO NOT TUNE ON THIS RANGE.
+oos_end: '2026-06-26'
+oos_start: '2018-01-01'
+symbol: swing_breakout_universe
+timeframe: 1d
