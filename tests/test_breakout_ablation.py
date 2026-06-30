@@ -8,8 +8,10 @@ changes behavior as MASTER_PLAN §5 specifies:
   * V2 PMH/PML setups generate trades the V0 PDH/PDL-only config does not.
   * V3 partial+runner produces a partial scale-out then a separate runner exit.
   * v0_atr_stop widens the role-reversal stop vs the 1-tick V0 stop.
-  * REGRESSION: V0 on the real QQQ data still matches the gate (188 trades, PF
-    ~1.41 tv_style) so the ablation refactor preserved V0 exactly.
+  * REGRESSION: V0 on the real QQQ data still matches the gate (218 trades, PF
+    ~1.34 tv_style on the Polygon/SIP re-pull) so the ablation refactor preserved
+    V0 exactly. (Was 188 / PF ~1.41 on the legacy Alpaca-IEX feed; the swap to
+    consolidated Polygon data changed the bar set, not the V0 logic.)
 """
 
 from __future__ import annotations
@@ -225,7 +227,9 @@ def test_v0_atr_stop_falls_back_to_ticks_without_atr():
 # --------------------------------------------------------------------------- #
 def test_v0_regression_matches_gate_on_real_data():
     # The ablation refactor must not perturb V0 at all: the real-data V0 run
-    # under tv_style must still produce the gate's 188 trades and PF ~1.41.
+    # under tv_style must still produce the gate's trade count and PF. Baselined
+    # to the Polygon/SIP QQQ 5m re-pull (218 trades, PF ~1.34, win ~0.40); the
+    # legacy Alpaca-IEX feed gave 188 / 1.41 / 0.436 before the data swap.
     pytest.importorskip("duckdb")
     from backtest.run_gate import load_qqq_5m, run_v0
     from data.schema import DEFAULT_DB_PATH, connect
@@ -234,6 +238,6 @@ def test_v0_regression_matches_gate_on_real_data():
     bars_df, levels_by_session = load_qqq_5m(con)
     res = run_v0(bars_df, levels_by_session, "tv_style")
     s = res.summary()
-    assert s["n_trades"] == 188
-    assert s["profit_factor"] == pytest.approx(1.411, abs=0.01)
-    assert s["win_rate"] == pytest.approx(0.436, abs=0.005)
+    assert s["n_trades"] == 218
+    assert s["profit_factor"] == pytest.approx(1.344, abs=0.01)
+    assert s["win_rate"] == pytest.approx(0.404, abs=0.005)

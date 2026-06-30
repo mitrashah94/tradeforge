@@ -198,8 +198,12 @@ def test_run_weekly_smoke_real_db(tmp_path):
             con=con, bus=bus, universe_db_path=universe_db,
             lookback_sessions=60,
         )
+        # CORE never exceeds its configured cap (read from criteria.yaml so this
+        # stays correct if the cap is re-tuned — it is 4, not the old hard-coded 2).
+        from watchlist.weekly import load_criteria
+        core_cap = int(load_criteria()["tiers"]["CORE"]["max_symbols"])
+        assert len(result.core()) <= core_cap
         # SPY + QQQ are ~0.95 correlated, so they cannot BOTH be CORE.
-        assert len(result.core()) <= 2
         assert not (set(result.core()) >= {"SPY", "QQQ"})
         # A WATCHLIST_UPDATED event was emitted.
         types = [e.type.value for e in bus.events]
