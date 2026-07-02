@@ -1,0 +1,84 @@
+# prop/firms.yaml — REPRESENTATIVE prop-firm rule profiles.
+#
+# These are approximate, illustrative profiles of the common evaluation models —
+# NOT live quotes. Firm rules, fees, and splits change often and vary by account
+# size and promo. ALWAYS verify the current rules on the firm's site before
+# committing a dollar; then load the exact numbers into a PropRules and re-run the
+# simulator. The point of these presets is to let the EV math run out of the box.
+#
+# Fields (see prop/rules.py::PropRules):
+#   account_size        nominal eval/funded capital ($)
+#   profit_target_pct   eval profit target as a fraction of account_size
+#   max_drawdown_pct    overall max loss as a fraction of account_size
+#   trailing            true -> DD threshold trails the equity high-water (EOD);
+#                       false -> static from the starting balance
+#   daily_loss_pct      daily loss limit as a fraction of account_size (null -> none)
+#   min_trading_days    minimum trading days before a pass counts
+#   consistency_pct     no single winning day may exceed this fraction of total
+#                       profit at pass time (null -> no consistency rule)
+#   profit_split        funded payout split kept by the trader (e.g. 0.90)
+#   eval_fee            cost to start ONE evaluation ($) — the true capped downside
+#   payout_min_profit_pct  funded: min profit (fraction of account) before a payout
+
+firms:
+  # Futures micro-account eval (Apex/Topstep-like). Cheapest, most accessible.
+  futures_50k:
+    account_size: 50000
+    profit_target_pct: 0.06      # ~+$3,000
+    max_drawdown_pct: 0.05       # ~$2,500 trailing threshold
+    trailing: true
+    daily_loss_pct: null         # many futures firms use only a trailing threshold
+    min_trading_days: 7
+    consistency_pct: 0.30        # no day > 30% of total profit (common futures rule)
+    profit_split: 0.90
+    eval_fee: 150
+    payout_min_profit_pct: 0.02
+
+  # FX / index CFD eval (FTMO-like): a two-phase-style single profile with a daily
+  # cap AND an overall cap, static from the start balance.
+  fx_10k:
+    account_size: 10000
+    profit_target_pct: 0.10      # +$1,000
+    max_drawdown_pct: 0.10       # -$1,000 overall (static)
+    trailing: false
+    daily_loss_pct: 0.05         # -$500 in a day
+    min_trading_days: 4
+    consistency_pct: null
+    profit_split: 0.85
+    eval_fee: 90
+    payout_min_profit_pct: 0.0
+
+  # SELF-FUNDED $1k "account" — NOT a real firm (no prop firm sells $1k funded
+  # accounts; the smallest real evals are ~$5k-$10k). This treats YOUR OWN $1,000
+  # as an account under self-imposed prop-style discipline: fee 0 (no eval to
+  # buy), split 1.0 (it's all yours), and the SAME percentage rules as
+  # equities_25k — which makes the scale-invariance explicit: P(pass) is identical
+  # to the $25k account, but every dollar figure (target, payout) is 1/25th.
+  # NOTE the fee=0 EV framing does NOT apply here: on your own money the drawdown
+  # is a REAL loss, not a capped fee — use prop.simulate.compound_to_target for
+  # the honest personal-account read.
+  personal_1k:
+    account_size: 1000
+    profit_target_pct: 0.08      # +$80
+    max_drawdown_pct: 0.08       # -$80 (static)
+    trailing: false
+    daily_loss_pct: 0.04         # -$40 in a day
+    min_trading_days: 10
+    consistency_pct: null
+    profit_split: 1.0
+    eval_fee: 0
+    payout_min_profit_pct: 0.0
+
+  # Equities / stock funded program (reuses the blended DAILY book directly — no
+  # new data). Modest target, static overall cap.
+  equities_25k:
+    account_size: 25000
+    profit_target_pct: 0.08      # +$2,000
+    max_drawdown_pct: 0.08       # -$2,000 overall
+    trailing: false
+    daily_loss_pct: 0.04         # -$1,000 in a day
+    min_trading_days: 10
+    consistency_pct: null
+    profit_split: 0.80
+    eval_fee: 200
+    payout_min_profit_pct: 0.0
