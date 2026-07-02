@@ -128,6 +128,12 @@ class SymbolEntry:
     rvol: float
     scores: dict = field(default_factory=dict)   # {strategy -> score float}
     reason: str = ""                       # why this tier (audit trail)
+    # ---- universe-engine metadata (Phase 2) ----
+    sector: str | None = None              # GICS sector / category (ETF map or MCP)
+    spread_bps: float = float("nan")       # bid/ask spread in bps (MCP quote)
+    fractional_enabled: bool = True        # fractional-share eligible (MCP tradability)
+    price_history_sessions: int = 0        # traded sessions of history (from bars)
+    cluster_id: str | None = None          # correlation-cluster representative
 
 
 @dataclass
@@ -209,6 +215,19 @@ def daily_price_returns(bars: pd.DataFrame, asset_class: str) -> pd.Series:
     return rets
 
 
+def price_history_sessions(bars: pd.DataFrame, asset_class: str) -> int:
+    """Number of distinct traded SESSIONS in a symbol's bars (the history gate).
+
+    Counted from the symbol's own bars' session dates, so a young ticker (a recent
+    listing / a fresh crypto-ETF) is correctly flagged as thin-history regardless
+    of how many intraday bars it has.
+    """
+    if bars is None or len(bars) == 0:
+        return 0
+    sess_fn = crypto_session_date if asset_class == "crypto" else et_session_date
+    return int(bars["ts_utc"].apply(sess_fn).nunique())
+
+
 def returns_correlation(
     symbols: list[str], bars_by_symbol: dict[str, pd.DataFrame]
 ) -> pd.DataFrame:
@@ -279,25 +298,36 @@ def assign_tiers(
     criteria: dict,
     bars_by_symbol: dict[str, pd.DataFrame],
 ) -> tuple[list[SymbolEntry], pd.DataFrame]:
-    """Assign CORE/ACTIVE/SCOUT tiers with the CORE correlation check.
+    """Assign CORE/ACTIVE/SCOUT tiers with the full universe-engine gates.
 
-    Candidates are processed best-fit-first. For each tier (CORE, then ACTIVE,
-    then SCOUT) we admit symbols that:
-      * clear the tier's liquidity/price thresholds, AND
-      * clear the tier's ``require_score`` level-respect gate, AND
-      * for CORE only: have daily-return correlation BELOW
-        ``core_max_correlation`` to every already-admitted CORE member.
-    A CORE candidate rejected by the correlation check (or by a full CORE) falls
-    through to ACTIVE. ACTIVE overflow falls through to SCOUT. Each tier is capped
-    at its ``max_symbols``.
+    Candidates are processed best-fit-first. A symbol earns a tier only if it
+    clears EVERY gate of that tier:
+      * liquidity / price (``min_dollar_volume`` / ``min_price``);
+      * the ``require_score`` level-respect gate;
+      * the metadata gates — ``max_spread_bps`` (tight enough to trade),
+        ``min_price_history_sessions`` (enough history), ``fractional_required``
+        (a $1k book can take a slice). Each gate is NON-BINDING when its metadata
+        is absent for the symbol, so the run works before any MCP refresh;
+      * a per-tier SECTOR-CONCENTRATION cap (``sector_max_concentration`` of the
+        tier's slots may share one sector);
+      * for CORE only: at most ONE name per correlation CLUSTER (single-linkage
+        union-find on daily-return correlation — replaces the old pairwise reject;
+        ``corr_cluster_threshold`` sets the collapse |rho|).
+    A CORE candidate rejected by the cluster / sector check falls through to
+    ACTIVE; ACTIVE overflow falls through to SCOUT. Each tier is capped at its
+    ``max_symbols``.
 
-    Returns ``(entries, core_corr)`` where ``core_corr`` is the correlation
-    matrix of the symbols that ended up in CORE (for persistence/inspection).
+    Returns ``(entries, core_corr)`` where ``core_corr`` is the correlation matrix
+    of the CORE symbols (persistence/inspection).
     """
+    from watchlist.clustering import cluster_symbols
+
     tiers_cfg = criteria.get("tiers", {})
-    core_max_corr = float(criteria.get("core_max_correlation", 0.85))
     default_gate = float(criteria.get("require_level_respect_score", 0.0))
     do_corr_check = bool(criteria.get("require_correlation_check", True))
+    cluster_thr = float(
+        criteria.get("corr_cluster_threshold", criteria.get("core_max_correlation", 0.85))
+    )
 
     # Best fit first; tie-break by liquidity so a more-liquid name wins a slot.
     ordered = sorted(
@@ -306,118 +336,131 @@ def assign_tiers(
         reverse=True,
     )
 
+    # Cluster every candidate ONCE off the daily-return correlation matrix; the
+    # CORE loop then admits at most one per cluster (the shared union-find).
+    cand_syms = [e.symbol for e in ordered]
+    corr_all = returns_correlation(cand_syms, bars_by_symbol)
+    clusters = cluster_symbols(cand_syms, corr_all, threshold=cluster_thr)
+    for e in ordered:
+        e.cluster_id = clusters.get(e.symbol, e.symbol)
+
     assigned: dict[str, SymbolEntry] = {}
     core_members: list[str] = []
 
-    def _clears(entry: SymbolEntry, cfg: dict) -> bool:
-        return (
-            entry.avg_dollar_volume >= float(cfg.get("min_dollar_volume", 0))
-            and entry.last_price >= float(cfg.get("min_price", 0))
-        )
+    def _g(cfg: dict, key: str, default):
+        """Tier-level override of a global criteria key (tier wins if present)."""
+        if key in cfg:
+            return cfg[key]
+        return criteria.get(key, default)
+
+    def _clears(entry: SymbolEntry, cfg: dict) -> str | None:
+        """Return a rejection reason if a hard gate fails, else None."""
+        if entry.avg_dollar_volume < float(cfg.get("min_dollar_volume", 0)):
+            return "below min_dollar_volume"
+        if entry.last_price < float(cfg.get("min_price", 0)):
+            return "below min_price"
+        # spread gate (non-binding when spread unknown / NaN)
+        max_spread = _g(cfg, "max_spread_bps", None)
+        if max_spread is not None and np.isfinite(entry.spread_bps):
+            if entry.spread_bps > float(max_spread):
+                return f"spread {entry.spread_bps:.0f}bps > {float(max_spread):.0f}"
+        # price-history gate
+        min_hist = _g(cfg, "min_price_history_sessions", None)
+        if min_hist is not None and entry.price_history_sessions > 0:
+            if entry.price_history_sessions < int(min_hist):
+                return (f"history {entry.price_history_sessions} "
+                        f"< {int(min_hist)} sessions")
+        # fractional-eligibility gate
+        if bool(_g(cfg, "fractional_required", False)) and not entry.fractional_enabled:
+            return "not fractional-eligible"
+        return None
 
     def _gate_for(cfg: dict) -> float:
         return float(cfg.get("require_score", default_gate))
 
-    # ---- CORE: gated, capped, AND correlation-checked ----
-    core_cfg = tiers_cfg.get("CORE", {})
-    core_cap = int(core_cfg.get("max_symbols", 4))
-    core_gate = _gate_for(core_cfg)
-    for entry in ordered:
-        if len(core_members) >= core_cap:
-            break
-        if entry.symbol in assigned:
-            continue
-        if not _clears(entry, core_cfg):
-            continue
-        if entry.fit_score < core_gate:
-            continue
-        # Correlation check vs current CORE members.
-        if do_corr_check and core_members:
-            max_corr = _max_corr_to(entry.symbol, core_members, bars_by_symbol)
-            if max_corr is not None and max_corr > core_max_corr:
+    def _sector_cap(cfg: dict, cap: int, tier_sectors: dict, sector: str | None) -> bool:
+        """True if admitting ``sector`` would breach the per-tier sector cap."""
+        frac = _g(cfg, "sector_max_concentration", None)
+        if frac is None or sector is None:
+            return False
+        max_per_sector = max(1, int(float(frac) * cap))
+        return tier_sectors.get(sector, 0) >= max_per_sector
+
+    def _fill_tier(tier: str, cfg: dict, cap: int, gate: float, *, cluster_check: bool):
+        tier_sectors: dict = {}
+        taken_clusters: set = set()
+        n = 0
+        for entry in ordered:
+            if n >= cap:
+                break
+            if entry.symbol in assigned:
+                continue
+            why = _clears(entry, cfg)
+            if why is not None:
+                if not entry.reason:
+                    entry.reason = f"{tier} rejected: {why}"
+                continue
+            if entry.fit_score < gate:
+                continue
+            if _sector_cap(cfg, cap, tier_sectors, entry.sector):
+                entry.reason = f"{tier} rejected: sector '{entry.sector}' cap reached"
+                continue
+            if cluster_check and do_corr_check and entry.cluster_id in taken_clusters:
                 entry.reason = (
-                    f"CORE rejected: corr {max_corr:.2f} > "
-                    f"{core_max_corr:.2f} to existing CORE"
+                    f"{tier} rejected: cluster {entry.cluster_id} already in {tier}"
                 )
-                continue  # falls through to ACTIVE below
-        entry.tier = "CORE"
-        entry.reason = entry.reason or f"CORE: fit {entry.fit_score:.2f}"
-        assigned[entry.symbol] = entry
-        core_members.append(entry.symbol)
-
-    # ---- ACTIVE: gated, capped (CORE rejects land here first) ----
-    active_cfg = tiers_cfg.get("ACTIVE", {})
-    active_cap = int(active_cfg.get("max_symbols", 8))
-    active_gate = _gate_for(active_cfg)
-    n_active = 0
-    for entry in ordered:
-        if n_active >= active_cap:
-            break
-        if entry.symbol in assigned:
-            continue
-        if not _clears(entry, active_cfg):
-            continue
-        if entry.fit_score < active_gate:
-            continue
-        entry.tier = "ACTIVE"
-        if not entry.reason or entry.reason.startswith("CORE rejected"):
+                continue
+            entry.tier = tier
             entry.reason = (
-                (entry.reason + "; " if entry.reason else "")
-                + f"ACTIVE: fit {entry.fit_score:.2f}"
+                f"{tier}: fit {entry.fit_score:.2f}"
+                if (not entry.reason or entry.reason.endswith("rejected"))
+                else entry.reason
             )
-        assigned[entry.symbol] = entry
-        n_active += 1
+            assigned[entry.symbol] = entry
+            taken_clusters.add(entry.cluster_id)
+            if entry.sector:
+                tier_sectors[entry.sector] = tier_sectors.get(entry.sector, 0) + 1
+            if tier == "CORE":
+                core_members.append(entry.symbol)
+            n += 1
 
-    # ---- SCOUT: gated, capped (observe-only tail) ----
+    core_cfg = tiers_cfg.get("CORE", {})
+    _fill_tier("CORE", core_cfg, int(core_cfg.get("max_symbols", 4)),
+               _gate_for(core_cfg), cluster_check=True)
+    active_cfg = tiers_cfg.get("ACTIVE", {})
+    _fill_tier("ACTIVE", active_cfg, int(active_cfg.get("max_symbols", 8)),
+               _gate_for(active_cfg), cluster_check=False)
     scout_cfg = tiers_cfg.get("SCOUT", {})
-    scout_cap = int(scout_cfg.get("max_symbols", 25))
-    scout_gate = _gate_for(scout_cfg)
-    n_scout = 0
-    for entry in ordered:
-        if n_scout >= scout_cap:
-            break
-        if entry.symbol in assigned:
-            continue
-        if not _clears(entry, scout_cfg):
-            continue
-        if entry.fit_score < scout_gate:
-            continue
-        entry.tier = "SCOUT"
-        entry.reason = entry.reason or f"SCOUT: fit {entry.fit_score:.2f}"
-        assigned[entry.symbol] = entry
-        n_scout += 1
+    _fill_tier("SCOUT", scout_cfg, int(scout_cfg.get("max_symbols", 25)),
+               _gate_for(scout_cfg), cluster_check=False)
 
     # Symbols that found no tier keep tier=None.
     core_corr = returns_correlation(core_members, bars_by_symbol)
     return ordered, core_corr
 
 
-def _max_corr_to(
-    symbol: str, others: list[str], bars_by_symbol: dict[str, pd.DataFrame]
-) -> float | None:
-    """Max absolute-but-signed daily-return correlation of ``symbol`` to ``others``.
-
-    Returns the maximum (most positive) pairwise correlation, or ``None`` if it
-    cannot be computed (no overlapping returns). We gate on the most-positive
-    correlation because two CORE names moving together is the concentration risk
-    we are trying to avoid (a strongly NEGATIVE pair is *good* diversification).
-    """
-    corr = returns_correlation([symbol] + list(others), bars_by_symbol)
-    if corr.empty or symbol not in corr.columns:
-        return None
-    vals = [
-        float(corr.loc[symbol, o])
-        for o in others
-        if o in corr.columns and not pd.isna(corr.loc[symbol, o])
-    ]
-    if not vals:
-        return None
-    return max(vals)
-
-
 # --------------------------------------------------------------------------- #
 # Persistence
 # --------------------------------------------------------------------------- #
+def _load_metadata(universe_db_path: str) -> dict:
+    """JOIN-side read of equity_metadata from universe.duckdb (empty if absent).
+
+    The deterministic path: it only READS a table a separate, off-hot-path MCP
+    refresh (``watchlist.fetch_metadata.refresh_metadata``) populated. Never calls
+    MCP itself, so ``run_weekly`` stays offline/deterministic.
+    """
+    if not os.path.exists(universe_db_path):
+        return {}
+    from watchlist.fetch_metadata import read_metadata
+    mcon = connect(universe_db_path)
+    try:
+        return read_metadata(mcon)
+    except Exception:  # noqa: BLE001 — metadata is optional; never block the run
+        return {}
+    finally:
+        mcon.close()
+
+
 def init_universe_schema(con) -> None:
     """Create the universe.duckdb tables if absent."""
     con.execute(
@@ -617,6 +660,10 @@ def run_weekly(
         # --- 1. candidate universe (screened) ---
         bars_by_symbol = load_universe_bars(con, timeframe=timeframe)
 
+        # Metadata (sector / spread / fractional) is fetched OFF the hot path into
+        # universe.duckdb.equity_metadata; here we just JOIN it (never call MCP).
+        metadata = _load_metadata(universe_db_path)
+
         eq_bars = {s: b for s, b in bars_by_symbol.items()
                    if _infer_asset_class(s) == "equity"}
         cx_bars = {s: b for s, b in bars_by_symbol.items()
@@ -641,10 +688,10 @@ def run_weekly(
         # --- 2. score each candidate against every strategy ---
         raw_scores: dict[str, dict] = {}
         candidates: list[SymbolEntry] = []
+        from watchlist.fetch_metadata import etf_sector
         for sym in candidate_syms:
-            stats = summarize_symbol(
-                sym, bars_by_symbol[sym], _infer_asset_class(sym)
-            )
+            asset_class = _infer_asset_class(sym)
+            stats = summarize_symbol(sym, bars_by_symbol[sym], asset_class)
             by_strat = score_symbol_all_strategies(
                 sym, strategies, timeframe, lookback_sessions, cost_profile, con
             )
@@ -654,10 +701,11 @@ def run_weekly(
                 best_score = by_strat[best_name].score
             else:
                 best_name, best_score = None, 0.0
+            m = metadata.get(sym, {})
             candidates.append(
                 SymbolEntry(
                     symbol=sym,
-                    asset_class=_infer_asset_class(sym),
+                    asset_class=asset_class,
                     tier=None,
                     fit_score=best_score,
                     best_strategy=best_name,
@@ -665,6 +713,10 @@ def run_weekly(
                     last_price=stats.last_price if stats else 0.0,
                     rvol=rvol_map.get(sym, float("nan")),
                     scores={n: s.score for n, s in by_strat.items()},
+                    sector=m.get("sector") or etf_sector(sym),
+                    spread_bps=m.get("spread_bps", float("nan")) if m.get("spread_bps") is not None else float("nan"),
+                    fractional_enabled=bool(m.get("fractional_enabled", True)),
+                    price_history_sessions=price_history_sessions(bars_by_symbol[sym], asset_class),
                 )
             )
 

@@ -124,3 +124,53 @@ maximization:
     holds: the min-variance blend has the highest Sharpe and the highest
     vol-targeted g. The structural benefit is real; the edges are just too weak
     in absolute terms to make any of them live-worthy yet.
+
+# --------------------------------------------------------------------------- #
+# DAILY multi-sleeve book (Phase-1 portfolio engine). DATA ONLY — the engine
+# READS this; it is hand-curated from a MEASURED run of
+# backtest/daily/portfolio_backtester.run_portfolio over each sleeve standalone
+# (TWR daily returns, 2018-01-01 -> 2025-12-31, market.duckdb, realistic costs).
+# These are the cross-strategy daily sleeves (NOT the intraday edges above).
+daily_sleeves:
+  members: [rotation, swing_meanrev, swing_breakout]   # rotation+meanrev are weight-shaped; breakout is score-shaped
+  # Operating allocation (the per-sleeve book share the engine sizes each sleeve
+  # by). HAND-CURATED to keep all three sleeves ACTIVE for decorrelation + the
+  # research conveyor, rather than letting the raw min-variance optimum zero a
+  # sleeve out. Sums to 1.0.
+  allocation:
+    method: hand_curated_active
+    weights:
+      rotation: 0.40
+      swing_meanrev: 0.30
+      swing_breakout: 0.30
+  # The raw long-only min-variance optimum on the measured return matrix (for
+  # reference / the maximization verdict). It zeroes rotation (higher-variance,
+  # more correlated) — the reason the OPERATING allocation is hand-floored instead.
+  minvariance_weights:
+    rotation: 0.000
+    swing_meanrev: 0.455
+    swing_breakout: 0.545
+  # Measured cross-sleeve correlation of the standalone TWR daily-return streams.
+  # Genuinely low (0.21-0.47) -> the decorrelation the blend's variance cut needs.
+  correlation_matrix:
+    order: [rotation, swing_meanrev, swing_breakout]
+    rotation:       {rotation: 1.000, swing_meanrev: 0.473, swing_breakout: 0.441}
+    swing_meanrev:  {rotation: 0.473, swing_meanrev: 1.000, swing_breakout: 0.213}
+    swing_breakout: {rotation: 0.441, swing_meanrev: 0.213, swing_breakout: 1.000}
+  # Measured maximization verdict for the daily book (min-variance blend).
+  maximization:
+    min_single_var: 2.233e-06          # swing_breakout standalone (lowest single variance)
+    minvar_blend_var: 1.450e-06        # the long-only min-variance blend
+    blend_variance_below_every_single: true    # the DURABLE thesis: decorrelation cuts variance
+    best_single_sharpe: 0.962          # swing_breakout standalone
+    minvar_blend_sharpe: 0.922         # blend Sharpe is close but below the best single here
+    vol_targeted_g_blend_beats_single: false   # honest: the breakout single edges the blend on vol-targeted g
+    integrated_book_pf: 1.764          # the engine's blended book (0.4/0.3/0.3) clears the daily haircut
+    note: >-
+      The blended daily book's variance reduction is REAL and robust (min-variance
+      blend var 1.45e-6 < the lowest single 2.23e-6, off-diagonal correlations
+      0.21-0.47). The integrated 0.4/0.3/0.3 book clears the promotion haircut
+      (PF 1.76 > bar at n_trials=3). Vol-targeted-g leadership belongs to the
+      breakout single, not the blend — matching the intraday verdict's honest read
+      that the durable maximization claim is variance reduction, not Sharpe
+      leadership. Still PAPER-track; nothing here flips a status to LIVE.

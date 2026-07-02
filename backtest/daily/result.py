@@ -352,3 +352,160 @@ class BracketResult:
             "tax_reserve": float(self.tax_reserve),
             "short_term_tax_rate": float(self.short_term_tax_rate),
         }
+
+
+# --------------------------------------------------------------------------- #
+# PortfolioResult — the CROSS-STRATEGY book result (Phase 1 portfolio engine).
+# --------------------------------------------------------------------------- #
+@dataclass
+class PortfolioTrade(BracketTrade):
+    """A closed book round-trip — a :class:`BracketTrade` tagged with its sleeve.
+
+    The portfolio engine pools trades from EVERY sleeve into one ledger, so each
+    record additionally carries the ``sleeve`` that owned it (for per-sleeve
+    attribution) and a ``kind`` (``"score"`` / ``"weight"``) so the analyst can
+    separate bracketed trades from reconciled weight legs. Weight-leg trades have
+    no true R basis, so their ``r_multiple`` is computed against the synthetic-stop
+    band recorded at open (an approximate but finite R).
+    """
+
+    sleeve: str = ""
+    kind: str = "score"
+
+
+@dataclass
+class PortfolioResult:
+    """The blended book's NAV curve + closed-trade ledger + deposit/edge split.
+
+    Built by :func:`backtest.daily.portfolio_backtester.run_portfolio`. The NAV /
+    after-tax / cost / tax / turnover / exposure machinery is shared VERBATIM with
+    :class:`BracketResult` (the book marks the same way); on top of it this result
+    carries:
+
+      * ``contributions`` — the DCA deposit stream (``{date: cash_flow}``), so TWR
+        (excludes flows → isolates the edge) and MWR/IRR (includes flows → the
+        investor experience) can both be reported (capability #7);
+      * ``twr_returns`` — the per-day flow-free return stream the validators judge;
+      * ``sleeve_attribution`` — net realized PnL per sleeve (who earned what);
+      * ``initial_equity`` / ``total_deposited`` — the capital base vs edge split.
+    """
+
+    nav: pd.Series                       # gross end-of-day equity, indexed by date
+    after_tax_nav: pd.Series             # nav minus running tax reserve
+    initial_equity: float
+    total_costs: float
+    tax_reserve: float
+    realized_gains: float
+    rebalance_turnover: pd.Series        # one-way turnover per trading date
+    short_term_tax_rate: float
+    trades: list = field(default_factory=list)        # list[PortfolioTrade]
+    exposure: pd.Series = field(default_factory=lambda: pd.Series(dtype="float64"))
+    contributions: dict = field(default_factory=dict)        # {date: cash_flow}
+    twr_returns: pd.Series = field(default_factory=lambda: pd.Series(dtype="float64"))
+    sleeve_attribution: dict = field(default_factory=dict)   # sleeve -> net realized PnL
+    total_deposited: float = 0.0
+    mwr_irr: float = float("nan")
+    periods_per_year: int = TRADING_DAYS_PER_YEAR
+
+    # ---- NAV-curve metric machinery (identical convention to BracketResult) ----
+    @property
+    def daily_returns(self) -> pd.Series:
+        """Per-day fractional NAV return (gross, INCLUDES deposit jumps).
+
+        For the flow-free edge series the validators consume, use
+        :attr:`twr_returns` (or :meth:`twr_daily_returns`) instead.
+        """
+        return DailyResult.daily_returns.fget(self)
+
+    @property
+    def after_tax_daily_returns(self) -> pd.Series:
+        return DailyResult.after_tax_daily_returns.fget(self)
+
+    def _years(self) -> float:
+        return DailyResult._years(self)
+
+    @staticmethod
+    def _cagr(curve: pd.Series, years: float) -> float:
+        return DailyResult._cagr(curve, years)
+
+    @staticmethod
+    def _total_return(curve: pd.Series) -> float:
+        return DailyResult._total_return(curve)
+
+    def turnover_per_year(self) -> float:
+        return DailyResult.turnover_per_year(self)
+
+    def avg_exposure(self) -> float:
+        return BracketResult.avg_exposure(self)
+
+    # ---- TWR (flow-free) curve metrics ----
+    def twr_curve(self, base: float = 1.0) -> pd.Series:
+        """The flow-free TWR index (``base * cumprod(1 + twr_returns)``)."""
+        if self.twr_returns is None or len(self.twr_returns) == 0:
+            return pd.Series(dtype="float64", name="twr_index")
+        curve = base * (1.0 + self.twr_returns).cumprod()
+        curve.name = "twr_index"
+        return curve
+
+    def twr_cagr(self) -> float:
+        """Annualized TWR (geometric) — the edge's compounded rate, deposit-free."""
+        rets = self.twr_returns
+        if rets is None or len(rets) < 1:
+            return float("nan")
+        growth = float((1.0 + rets).prod())
+        years = len(rets) / float(self.periods_per_year)
+        if years <= 0 or growth <= 0:
+            return float("nan")
+        return growth ** (1.0 / years) - 1.0
+
+    @property
+    def edge_pnl(self) -> float:
+        """Terminal NAV minus all external capital (initial + deposits) — pure edge $."""
+        if self.nav is None or len(self.nav) == 0:
+            return float("nan")
+        terminal = float(self.nav.astype("float64").iloc[-1])
+        return terminal - float(self.initial_equity) - float(self.total_deposited)
+
+    # ---- trade-ledger metrics ----
+    def _trade_arrays(self):
+        return BracketResult._trade_arrays(self)
+
+    # ----------------------------------------------------------- summary
+    def summary(self) -> dict:
+        """Headline book metrics: gross + TWR + MWR + the deposit/edge split."""
+        years = self._years()
+        rets = self.daily_returns
+        ann_vol = (
+            float(np.std(rets.to_numpy(), ddof=1) * np.sqrt(self.periods_per_year))
+            if len(rets) >= 2 else float("nan")
+        )
+        pnls, rs = self._trade_arrays()
+        n_trades = int(pnls.size)
+        win_rate = float((pnls > 0).mean()) if n_trades else float("nan")
+        finite_rs = rs[np.isfinite(rs)] if rs.size else rs
+        avg_R = float(finite_rs.mean()) if finite_rs.size else float("nan")
+        trades_per_year = (n_trades / years) if years > 0 else float("nan")
+        return {
+            "n_days": int(len(self.nav)) if self.nav is not None else 0,
+            "years": years,
+            "total_return": self._total_return(self.nav),
+            "CAGR": self._cagr(self.nav, years),
+            "after_tax_CAGR": self._cagr(self.after_tax_nav, years),
+            "max_drawdown": max_drawdown(self.nav) if self.nav is not None else 0.0,
+            "ann_vol": ann_vol,
+            "twr_cagr": self.twr_cagr(),
+            "mwr_irr": float(self.mwr_irr),
+            "total_deposited": float(self.total_deposited),
+            "edge_pnl": self.edge_pnl,
+            "win_rate": win_rate,
+            "avg_R": avg_R,
+            "n_trades": n_trades,
+            "trades_per_year": trades_per_year,
+            "avg_exposure": self.avg_exposure(),
+            "turnover_per_year": self.turnover_per_year(),
+            "total_costs": float(self.total_costs),
+            "realized_gains": float(self.realized_gains),
+            "tax_reserve": float(self.tax_reserve),
+            "short_term_tax_rate": float(self.short_term_tax_rate),
+            "sleeve_attribution": dict(self.sleeve_attribution),
+        }
