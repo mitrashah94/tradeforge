@@ -15,7 +15,25 @@ tiers:
 # Fallback per-strategy fit gate if a tier omits require_score.
 require_level_respect_score: 0.0
 
-# CORE diversification: reject a CORE candidate whose daily-return correlation to
-# any existing CORE member exceeds this threshold.
+# CORE diversification: admit at most ONE CORE name per correlation CLUSTER
+# (single-linkage union-find on daily-return correlation, shared with the Phase-1
+# portfolio engine via watchlist/clustering.py). corr_cluster_threshold is the
+# |rho| at/above which two names collapse into one cluster; it replaces the old
+# O(n^2) pairwise reject (core_max_correlation is kept as the back-compat default
+# for the threshold). require_correlation_check toggles the whole check.
 require_correlation_check: true
 core_max_correlation: 0.85
+corr_cluster_threshold: 0.85
+
+# ---- metadata gates (from watchlist/fetch_metadata.equity_metadata, MCP-fetched
+# off the hot path). A gate is NON-BINDING when its metadata is absent for a
+# symbol, so run_weekly works before the first refresh. Set globally; a tier may
+# override any key under its own block. ----
+max_spread_bps: 50               # reject names whose bid/ask spread exceeds this (bps)
+min_price_history_sessions: 252  # require >= ~1y of traded sessions (computed from bars)
+fractional_required: false       # require fractional eligibility (true for a small book)
+
+# Per-tier sector-concentration cap: at most this FRACTION of a tier's max_symbols
+# may share one sector (so CORE can't be three Tech names). Non-binding when a
+# symbol's sector is unknown.
+sector_max_concentration: 0.5

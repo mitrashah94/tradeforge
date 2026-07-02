@@ -1,0 +1,42 @@
+# portfolio/config.yaml — tunables for the cross-strategy PORTFOLIO ENGINE.
+#
+# This is the home of the ONE genuinely-new modeling knob the portfolio layer
+# introduces: the SYNTHETIC STOP BAND for weight-sleeve positions. A bracketed
+# score lot has a natural dollar-risk = shares*(entry-stop); a weight-sleeve lot
+# has NO stop, so its contribution to the book heat budget is otherwise undefined.
+# We give every weight-sleeve position a synthetic trailing-vol band
+# stop = mark - k*ATR(window) so it contributes a COMPARABLE dollar-risk to the
+# heat cap. This band is a heat-accounting device ONLY — it does NOT stop the
+# position out (weight lots are managed by the reconcile-to-target loop, never an
+# intraday stop). It deliberately lives HERE, never in risk/limits.yaml (which is
+# hand-edited single-source-of-truth for the risk dial; this is engine policy).
+#
+# Everything else (RI table, heat %, halts, ratchet, program-abort) is READ from
+# risk/limits.yaml — this file never duplicates it.
+
+synthetic_stop:
+  k: 2.5          # band width in ATR multiples (mirrors the bracket default stop_atr_mult)
+  window: 14      # ATR lookback (trading days) for the synthetic band
+  fallback_band_frac: 0.15   # band as a fraction of mark when ATR is unavailable (young ticker)
+
+# Per-RISK-FAMILY heat caps (fraction of equity). The book-wide heat cap comes
+# from risk/limits.yaml (portfolio_heat_pct); these optionally bound any single
+# family BELOW that so one correlated family can't eat the whole budget. A family
+# absent from this map is bounded only by the book-wide cap. Empty -> book cap only.
+family_caps: {}
+  # example:
+  # trend: 0.04
+  # mean_reversion: 0.03
+
+# Backtest accounting (mirrors the per-sleeve engines' defaults).
+cost_bps: 2.0
+short_term_tax_rate: 0.30
+
+# Kronos forecasting overlay (Phase 3). Off by default so the engine runs without
+# torch; when enabled the ranker blends exp_return into the score and the budgeter
+# can veto a candidate with a negative forecast / excess downside.
+kronos:
+  use_kronos: false
+  rank_blend: 0.0          # weight on the Kronos exp_return term in the rank score
+  veto_negative_return: false
+  max_downside_cvar: null  # veto a candidate whose downside_cvar exceeds this (null -> off)

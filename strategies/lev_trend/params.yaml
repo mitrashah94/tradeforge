@@ -1,0 +1,29 @@
+# strategies/lev_trend/params.yaml — the LEVERAGED TREND-GATE sleeve.
+#
+# The canonical "Leverage for the Long Run" shape (Gayed): hold a 2x/3x LONG
+# index ETF while the benchmark trades ABOVE its long SMA; step aside to a safe
+# asset below it. The trend filter is what makes leverage survivable — the
+# catastrophic leveraged drawdowns live below the 200DMA, so gating there clips
+# the left tail while keeping the levered right tail. This is the highest-prior
+# missing family for the PROP-EVAL objective (return-per-drawdown, spiky upside).
+#
+# HONESTY: leveraged ETFs bleed on volatility decay in chop, and the daily gate
+# whipsaws around the SMA (each flip costs a round-trip). The strategy is
+# regime-dependent by construction — it prints in trending bulls and chops
+# sideways in ranging tape. LONG-ONLY weights; no shorting.
+
+defaults:
+  benchmark: SPY          # the trend gate is measured on this
+  sma_window: 200         # the canonical long-trend SMA
+  lev_symbol: QLD         # the levered long held when risk-on (2x QQQ)
+  safe_symbol: BIL        # parked here when risk-off (T-bills)
+  require_mom: false      # true -> ALSO require positive 12m benchmark momentum
+  mom_lookback: 252       # the 12m momentum window for the dual gate
+  weight_cap: 1.0         # fraction of the sleeve deployed (rest cash)
+
+variants:
+  DEFAULT: {}                                     # QLD / BIL on the SPY 200d gate
+  TQQQ:      {lev_symbol: TQQQ}                   # 3x — more juice, more decay/DD
+  TQQQ_TLT:  {lev_symbol: TQQQ, safe_symbol: TLT} # bonds instead of bills off-risk
+  QQQ_GATE:  {benchmark: QQQ, lev_symbol: TQQQ}   # gate on QQQ itself
+  DUAL_GATE: {require_mom: true, lev_symbol: TQQQ} # SMA AND 12m momentum both
