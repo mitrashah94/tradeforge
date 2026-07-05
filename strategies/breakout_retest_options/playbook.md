@@ -123,6 +123,30 @@ the cheapest ticket exceeds the hard ceiling, the overlay still skips with
 > makes each contract a smaller slice of $1k and lets the RI halts breathe — at
 > the cost of leaving the SPY/QQQ break-retest universe.
 
+## Live evaluation runner (`evaluate.py`)
+
+`python3 -m strategies.breakout_retest_options.evaluate --side long --equity 1000 --time 10:05`
+pulls a live SPY/QQQ chain + IV-rank estimate from **Polygon** and prints the
+overlay's decision. It is a RESEARCH aid — it prints, it never orders.
+
+Built around the free-tier constraints:
+
+- **5 calls/min** — every network call is throttled by a `RateLimiter` (12s
+  spacing). One evaluation ≈ 2 calls/underlying (chain snapshot + 1y daily bars),
+  so SPY+QQQ ≈ 4 calls, inside a minute.
+- **Greeks may be missing** on the free snapshot → filled locally with
+  **Black-Scholes** from IV (`bs_greeks`); 0DTE time-to-expiry is floored so
+  greeks don't blow up.
+- **IV rank is a PROXY** (`iv_rank_proxy`): the current ATM IV ranked inside the
+  trailing 1-year envelope of 20-day realized vol — no paid IV-history feed
+  needed. Labelled a proxy everywhere it prints. Swap in a true IV-history source
+  when available.
+- **`--offline`** runs the whole path on a built-in fixture (no key/SDK/network) —
+  the mode the tests use.
+
+Set `POLYGON_API_KEY` (see `.env.example`). If the key's Options tier lacks IV on
+the snapshot, the runner can't derive greeks and drops those contracts.
+
 ## Status
 
 **RESEARCH.** No independent edge stats — it inherits `breakout_retest`'s trigger
