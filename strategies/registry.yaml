@@ -86,6 +86,25 @@ strategies:
       fade misses. High single-sleeve variance keeps its min-variance weight
       small, but it is near-uncorrelated to both others (-0.016 / -0.036). Keep
       RESEARCH.
+  breakout_retest_options:
+    status: RESEARCH         # options-EXPRESSION overlay on breakout_retest (SPY/QQQ)
+    regime: trend_continuation
+    headline_variant: DEFAULT
+    allocation: 0.0          # not in the live blend; RESEARCH-only decision aid
+    overlay_of: breakout_retest   # inherits the trigger; NOT an independent edge
+    edge: null               # no standalone edge stats — options costs unvalidated
+    note: >-
+      Deterministic IV-rank-driven overlay that maps a break-retest signal to a
+      DEFINED-RISK options structure on SPY/QQQ: low IV rank -> long option, mid
+      -> debit vertical, high -> theta-positive credit spread; delta picks the
+      strikes; a theta gate blocks long-premium bleed; the RI options policy
+      (limits.yaml level(ri).options) gates permission + size. It carries NO
+      independent edge — it inherits breakout_retest's trigger and must clear the
+      paper->live gates on OPTIONS-realistic costs before anything goes live. Key
+      honest finding: at $1k a per-trade budget (~$12 at RI-6) cannot size even
+      one SPY/QQQ contract (worst-case loss ~$300); the overlay SKIPS and reports
+      min_viable_equity (~$25k) rather than over-risking a 1-lot. See
+      strategies/breakout_retest_options/playbook.md.
 
 # Live correlation matrix (full-period realistic daily fractional returns, QQQ 5m,
 # union calendar with flat days = 0). Genuinely low / negative off-diagonals ->

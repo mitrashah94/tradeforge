@@ -1,0 +1,47 @@
+# strategies/breakout_retest_options/params.yaml — sweepable knobs for the
+# IV-rank-driven options overlay on the breakout_retest signal (SPY / QQQ).
+#
+# The overlay is deterministic and RESEARCH-only: it maps a break-retest signal
+# + IV rank + delta/theta targets + the RI options policy -> a defined-risk
+# options structure and a size. It reads these params; it never writes live
+# config (CLAUDE.md "Self-improvement"). Tune by hand, deliberately.
+
+defaults:
+  # ---- IV-rank regime thresholds (iv_rank is 0..1) -----------------------
+  # low  -> buy premium (long single option); mid -> debit vertical;
+  # high -> credit spread (net-short premium, theta works FOR the position).
+  iv_rank_low: 0.30
+  iv_rank_high: 0.60
+
+  # ---- delta targets (|delta|) select the strikes ------------------------
+  long_delta_target: 0.55          # long single option / debit long leg (band ~0.45-0.60)
+  debit_short_delta_target: 0.30   # debit vertical short leg (caps cost + theta)
+  credit_short_delta_target: 0.32  # credit spread SHORT leg (the premium we sell)
+  credit_long_delta_target: 0.16   # credit spread protective long leg (defines risk)
+
+  # ---- expiration (intraday: short-dated, but avoid the 0DTE theta cliff) -
+  prefer_dte: 1                    # aim for next-day weeklies
+  min_dte: 1                       # 0DTE off by default (gamma/theta cliff); set 0 to allow
+  max_dte: 7
+
+  # ---- liquidity gates ---------------------------------------------------
+  max_spread_pct: 0.12             # reject a leg whose bid/ask spread > 12% of mid
+  min_open_interest: 100           # skip illiquid strikes (0 disables)
+
+  # ---- sizing caps (the size is the conservative MIN of all three) -------
+  # 1) vol-target: contracts so $-loss at the underlying stop == dollar_risk.
+  # 2) max-loss:   worst-case defined loss <= max_loss_mult * dollar_risk.
+  # 3) premium:    cash outlay / collateral <= max_premium_pct * equity.
+  max_loss_mult: 1.0               # worst-case defined loss may reach 1x the risk budget
+  max_premium_pct_of_equity: 0.20  # <=20% of equity per ticket (RI "ok")
+  small_max_premium_pct_of_equity: 0.10   # tighter cap under 'minimal'/'defined_risk_small'
+
+  # On a tiny account (see playbook: $1k can't size 1 SPY/QQQ contract inside a
+  # ~$12 budget) the overlay SKIPS by default and reports min_viable_equity.
+  # Flip this to force exactly one defined-risk contract, stamped over_budget.
+  allow_min_ticket: false
+
+  # ---- theta gate (bites long-premium tickets only; credit is theta+) ----
+  intraday_hold_fraction: 0.5      # fraction of a calendar day of theta we budget for
+  max_theta_to_edge: 0.35          # reject if theta over the hold > 35% of move-to-target edge
+  reject_on_theta_gate: true       # false -> warn but keep the ticket
