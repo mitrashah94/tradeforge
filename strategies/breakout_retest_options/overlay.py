@@ -3,8 +3,8 @@
 An **execution overlay**, not an independent edge. It takes a *break-and-retest*
 signal on the underlying (the same PDH/PDL continuation trigger the
 ``breakout_retest`` equity strategy fires — direction, spot, protective stop,
-fixed-2R target, conviction grade) and decides **how to express that directional
-view in listed options** on SPY / QQQ, driven by:
+fixed-2R target, conviction grade, and the signal TIME) and decides **how to
+express that directional view in listed options** on SPY / QQQ, driven by:
 
   * **IV rank** — cheap vs rich premium picks the STRUCTURE:
       low IVR  -> buy premium        (long single option, full theta exposure)
@@ -16,18 +16,26 @@ view in listed options** on SPY / QQQ, driven by:
   * **the RI options policy** (``risk/limits.yaml`` -> ``level(ri).options``) —
       gates whether options are permitted at all and caps the ticket size.
 
+Two sizing philosophies (``sizing_mode``):
+
+  * **vol_target** (default) — the equity-strategy discipline: size so the
+      first-order $-loss at the *underlying* stop equals the 1%-ish per-trade
+      budget. On a small account this rounds to ZERO SPY/QQQ contracts and the
+      overlay honestly SKIPS (reports ``min_viable_equity``).
+  * **premium_risk** (the ``small_account_first90`` profile) — the real
+      small-account options unit: risk a fixed % of equity as *premium at risk*
+      (a defined-risk ticket's max loss). It STEERS to the cheapest defined-risk
+      structure that fits (downgrade ladder), sizes 1-2 contracts, and LOUDLY
+      reports the true per-trade risk % — which for $1k SPY/QQQ is ~6-12%, far
+      above the 1% equity rule and above the RI daily halt. That widening is a
+      deliberate, surfaced choice, never silent.
+
 Everything here is a PURE, deterministic function of its inputs — no clock, no
 network, no I/O, no LLM (CLAUDE.md: "No LLM and no MCP calls in the hot path").
 The overlay READS the risk config; it never writes it. It emits a decision an
 operator (or a paper driver) inspects; it does NOT place orders — options are
 not on the sanctioned agentic order path (CLAUDE.md P0 #3), so this module is a
 RESEARCH / paper-evaluation tool.
-
-The $1,000 reality (see ``playbook.md``): at the RI-6 floor a per-trade risk
-budget is ~1.25% = ~$12.50, while ONE SPY/QQQ contract's first-order loss at the
-underlying stop is typically $30-$60. So a disciplined vol-target size rounds to
-ZERO contracts. The overlay reports this honestly (``min_viable_equity`` + the
-binding constraint) rather than silently rounding up to an over-risked 1-lot.
 """
 
 from __future__ import annotations
@@ -56,12 +64,23 @@ IVR_LOW = "low"
 IVR_MID = "mid"
 IVR_HIGH = "high"
 
+# Sizing modes.
+SIZE_VOL_TARGET = "vol_target"
+SIZE_PREMIUM_RISK = "premium_risk"
 
-def load_params(path: str | Path = DEFAULT_PARAMS_PATH) -> dict:
-    """Load the overlay's ``defaults`` block from params.yaml."""
+
+def load_params(profile: str | None = None, path: str | Path = DEFAULT_PARAMS_PATH) -> dict:
+    """Load ``defaults`` optionally merged with a named ``profile`` delta."""
     with open(path, "r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
-    return dict(raw.get("defaults", {}))
+    params = dict(raw.get("defaults", {}))
+    if profile is not None:
+        profiles = raw.get("profiles", {}) or {}
+        if profile not in profiles:
+            raise KeyError(f"unknown profile {profile!r}; have {sorted(profiles)}")
+        params.update(profiles[profile] or {})
+        params["_profile"] = profile
+    return params
 
 
 # --------------------------------------------------------------------------- #
@@ -75,6 +94,8 @@ class UnderlyingSignal:
     ``short`` -> bearish (puts / bear spreads). ``spot`` is the signal close,
     ``stop`` the role-reversal protective stop, ``target`` the fixed-2R target
     (may be ``None`` for a trailing exit). ``grade`` maps to the risk index.
+    ``time_et`` is the signal's Eastern wall-clock time ('HH:MM' or a datetime),
+    used by the first-N-minutes session gate.
     """
 
     symbol: str
@@ -83,6 +104,7 @@ class UnderlyingSignal:
     stop: float
     target: float | None = None
     grade: str = "B"
+    time_et: str | object | None = None
 
     @property
     def stop_distance(self) -> float:
@@ -145,9 +167,10 @@ class OverlayDecision:
     """The overlay's verdict for one signal.
 
     ``ok`` is True only when a tradable, correctly-sized ticket was found. When
-    False, ``reason`` says why (policy block, no chain, liquidity, sub-one
-    contract, ...) and ``diagnostics`` still carries the useful numbers
-    (``min_viable_equity``, the binding sizing constraint, greeks).
+    False, ``reason`` says why (policy block, session window, no chain,
+    liquidity, sub-one contract, unaffordable, ...) and ``diagnostics`` still
+    carries the useful numbers (``min_viable_equity``, the binding constraint,
+    greeks, the true risk %).
     """
 
     ok: bool
@@ -200,7 +223,6 @@ def choose_structure(iv_regime: str, policy: str) -> str | None:
         return None
     if policy == _POLICY_MINIMAL:
         return STRUCT_LONG
-    # defined_risk_small and ok: IV rank drives it.
     if iv_regime == IVR_LOW:
         return STRUCT_LONG
     if iv_regime == IVR_MID:
@@ -220,14 +242,21 @@ def nearest_delta(contracts: list[OptionContract], target_abs: float) -> OptionC
     return min(contracts, key=lambda c: abs(abs(c.delta) - target_abs))
 
 
+def _minutes_et(t) -> int | None:
+    """Minutes since ET midnight from 'HH:MM' or a datetime/time-like object."""
+    if t is None:
+        return None
+    if hasattr(t, "hour"):
+        return int(t.hour) * 60 + int(t.minute)
+    hh, mm = str(t).split(":")[:2]
+    return int(hh) * 60 + int(mm)
+
+
 def _pick_expiration(
     chain: list[OptionContract], right: str, as_of: date | None,
     prefer_dte: int, min_dte: int, max_dte: int,
 ) -> tuple[str | None, list[OptionContract]]:
-    """Choose the expiration nearest ``prefer_dte`` within [min_dte, max_dte].
-
-    Returns the chosen expiration string and the contracts of ``right`` at it.
-    """
+    """Choose the expiration nearest ``prefer_dte`` within [min_dte, max_dte]."""
     by_exp: dict[str, list[OptionContract]] = {}
     for c in chain:
         if c.right != right:
@@ -238,9 +267,10 @@ def _pick_expiration(
         by_exp.setdefault(c.expiration, []).append(c)
     if not by_exp:
         return None, []
-    # nearest expiration to prefer_dte (by any of its contracts' dte).
+
     def exp_dte(exp: str) -> int:
         return _dte_of(by_exp[exp][0], as_of) or 0
+
     chosen = min(by_exp, key=lambda e: (abs(exp_dte(e) - prefer_dte), exp_dte(e)))
     return chosen, by_exp[chosen]
 
@@ -263,78 +293,134 @@ def _liquid(c: OptionContract, max_spread_pct: float, min_oi: int) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Structure builders — each returns (legs, net_debit, net_credit, max_loss,
-# max_profit, breakeven) or None if it cannot be built from the chain.
+# Structure builders. Each returns a 6-tuple
+#   (legs, net_debit, net_credit, max_loss_pc, max_profit_pc, breakeven)
+# or None if it cannot be built from the chain. ``_maxloss`` reads index 3.
 # --------------------------------------------------------------------------- #
-def _build_long(cands: list[OptionContract], p: dict, side: str):
-    tgt = nearest_delta(cands, p["long_delta_target"])
-    if tgt is None:
-        return None
-    debit = tgt.ask * 100.0                    # pay the ask (marketable)
-    be = tgt.strike + tgt.ask if side == "long" else tgt.strike - tgt.ask
-    return (
-        [Leg("buy", tgt)],
-        debit, 0.0,
-        debit,                                 # max loss = premium paid
-        None,                                  # unbounded (dir.) upside
-        be,
-    )
+def _maxloss(built) -> float:
+    return built[3] if built else float("inf")
 
 
-def _build_debit_vertical(cands: list[OptionContract], p: dict, side: str):
-    long_leg = nearest_delta(cands, p["long_delta_target"])
-    short_leg = nearest_delta(cands, p["debit_short_delta_target"])
-    if long_leg is None or short_leg is None or long_leg.strike == short_leg.strike:
+def _debit_from(long_leg: OptionContract, short_leg: OptionContract, side: str):
+    """Assemble a debit vertical from an explicit long+short leg (validated)."""
+    if long_leg.strike == short_leg.strike:
         return None
-    # correct ordering: bull call -> short strike ABOVE long; bear put -> below.
     if side == "long" and not short_leg.strike > long_leg.strike:
         return None
     if side == "short" and not short_leg.strike < long_leg.strike:
         return None
     net_debit = (long_leg.ask - short_leg.bid) * 100.0
-    width = abs(long_leg.strike - short_leg.strike) * 100.0
     if net_debit <= 0:
         return None
-    max_profit = width - net_debit
+    width = abs(long_leg.strike - short_leg.strike) * 100.0
     be = (long_leg.strike + net_debit / 100.0) if side == "long" \
         else (long_leg.strike - net_debit / 100.0)
-    return (
-        [Leg("buy", long_leg), Leg("sell", short_leg)],
-        net_debit, 0.0,
-        net_debit,                             # max loss = net debit
-        max_profit,
-        be,
-    )
+    return ([Leg("buy", long_leg), Leg("sell", short_leg)],
+            net_debit, 0.0, net_debit, width - net_debit, be)
 
 
-def _build_credit_spread(cands: list[OptionContract], p: dict, side: str):
-    # Same directional bias, but SELL premium: long view -> bull PUT credit
-    # spread (sell higher put, buy lower put); short view -> bear CALL credit
-    # spread (sell lower call, buy higher call).
-    right = "put" if side == "long" else "call"
-    legs_pool = [c for c in cands if c.right == right]
-    short_leg = nearest_delta(legs_pool, p["credit_short_delta_target"])
-    long_leg = nearest_delta(legs_pool, p["credit_long_delta_target"])
-    if short_leg is None or long_leg is None or short_leg.strike == long_leg.strike:
+def _credit_from(short_leg: OptionContract, long_leg: OptionContract, right: str):
+    """Assemble a credit spread from an explicit short+long protective leg."""
+    if short_leg.strike == long_leg.strike:
         return None
     if right == "put" and not long_leg.strike < short_leg.strike:
         return None
     if right == "call" and not long_leg.strike > short_leg.strike:
         return None
     net_credit = (short_leg.bid - long_leg.ask) * 100.0
-    width = abs(short_leg.strike - long_leg.strike) * 100.0
     if net_credit <= 0:
         return None
-    max_loss = width - net_credit
+    width = abs(short_leg.strike - long_leg.strike) * 100.0
     be = (short_leg.strike - net_credit / 100.0) if right == "put" \
         else (short_leg.strike + net_credit / 100.0)
-    return (
-        [Leg("sell", short_leg), Leg("buy", long_leg)],
-        0.0, net_credit,
-        max_loss,                              # max loss = width - credit
-        net_credit,                            # max profit = credit kept
-        be,
-    )
+    return ([Leg("sell", short_leg), Leg("buy", long_leg)],
+            0.0, net_credit, width - net_credit, net_credit, be)
+
+
+def _build_long(cands, p, side, delta_target=None):
+    right = _right_for(side)
+    pool = [c for c in cands if c.right == right]
+    tgt = nearest_delta(pool, delta_target if delta_target is not None else p["long_delta_target"])
+    if tgt is None:
+        return None
+    debit = tgt.ask * 100.0
+    be = tgt.strike + tgt.ask if side == "long" else tgt.strike - tgt.ask
+    return ([Leg("buy", tgt)], debit, 0.0, debit, None, be)
+
+
+def _build_debit_vertical(cands, p, side):
+    right = _right_for(side)
+    pool = [c for c in cands if c.right == right]
+    long_leg = nearest_delta(pool, p["long_delta_target"])
+    short_leg = nearest_delta(pool, p["debit_short_delta_target"])
+    if long_leg is None or short_leg is None:
+        return None
+    return _debit_from(long_leg, short_leg, side)
+
+
+def _build_credit_spread(cands, p, side):
+    right = "put" if side == "long" else "call"
+    pool = [c for c in cands if c.right == right]
+    short_leg = nearest_delta(pool, p["credit_short_delta_target"])
+    long_leg = nearest_delta(pool, p["credit_long_delta_target"])
+    if short_leg is None or long_leg is None:
+        return None
+    return _credit_from(short_leg, long_leg, right)
+
+
+# ------------------------------- cheap downgrade builders (small-account) ----
+def _strikes_of(pool, right):
+    return sorted({c.strike for c in pool if c.right == right})
+
+
+def _at_strike(pool, right, strike):
+    for c in pool:
+        if c.right == right and c.strike == strike:
+            return c
+    return None
+
+
+def _build_narrow_debit(cands, p, side, width_strikes=1):
+    """Buy the target-delta leg, sell the strike ``width_strikes`` steps OTM."""
+    right = _right_for(side)
+    pool = [c for c in cands if c.right == right]
+    long_leg = nearest_delta(pool, p["long_delta_target"])
+    if long_leg is None:
+        return None
+    strikes = _strikes_of(pool, right)
+    idx = strikes.index(long_leg.strike)
+    j = idx + width_strikes if side == "long" else idx - width_strikes
+    if j < 0 or j >= len(strikes):
+        return None
+    short_leg = _at_strike(pool, right, strikes[j])
+    return _debit_from(long_leg, short_leg, side) if short_leg else None
+
+
+def _build_cheapest_long(cands, p, side, ceiling):
+    """The highest-|delta| single long whose debit fits ``ceiling`` (most
+    directional participation per dollar). None if nothing fits."""
+    right = _right_for(side)
+    pool = [c for c in cands if c.right == right and c.ask * 100.0 <= ceiling]
+    if not pool:
+        return None
+    best = max(pool, key=lambda c: abs(c.delta))
+    return _build_long([best], p, side, delta_target=abs(best.delta))
+
+
+def _build_narrow_credit(cands, p, side, width_strikes=1):
+    right = "put" if side == "long" else "call"
+    pool = [c for c in cands if c.right == right]
+    short_leg = nearest_delta(pool, p["credit_short_delta_target"])
+    if short_leg is None:
+        return None
+    strikes = _strikes_of(pool, right)
+    idx = strikes.index(short_leg.strike)
+    # protective long is further OTM: lower strike for puts, higher for calls.
+    j = idx - width_strikes if right == "put" else idx + width_strikes
+    if j < 0 or j >= len(strikes):
+        return None
+    long_leg = _at_strike(pool, right, strikes[j])
+    return _credit_from(short_leg, long_leg, right) if long_leg else None
 
 
 # --------------------------------------------------------------------------- #
@@ -358,13 +444,15 @@ class OptionsOverlay:
         dollar_risk: float,
         ri: int = 0,
         as_of: date | None = None,
+        daily_halt_pct: float | None = None,
     ) -> OverlayDecision:
         """Choose a structure + strikes + size for ``signal``.
 
         ``options_policy`` and ``dollar_risk`` come from the resolved risk index
         (``risk.config.Limits`` -> ``level(ri).options`` and
-        ``risk.sizing.per_trade_dollar_risk``); pass them in so this stays a pure
-        function decoupled from the risk loader. ``iv_rank`` is 0..1.
+        ``risk.sizing.per_trade_dollar_risk``). ``iv_rank`` is 0..1.
+        ``daily_halt_pct`` (optional, from ``level(ri).daily_halt_pct``) lets the
+        overlay flag when one options ticket risks more than the daily halt.
         """
         p = self.p
         dec = OverlayDecision(
@@ -373,12 +461,22 @@ class OptionsOverlay:
             structure="none", ri=ri, options_policy=options_policy,
         )
 
+        # 0) session window gate (e.g. first 90 minutes only)
+        n = int(p.get("session_first_n_minutes", 0))
+        if n > 0:
+            open_m = _minutes_et(p.get("session_open_et", "09:30"))
+            sig_m = _minutes_et(signal.time_et)
+            if sig_m is None:
+                dec.warnings.append("session_gate_enabled_but_no_signal_time")
+            elif not (open_m <= sig_m < open_m + n):
+                dec.reason = f"outside_first_{n}min_window"
+                return dec
+
         # 1) policy gate
         structure = choose_structure(dec.iv_regime, options_policy)
         if structure is None:
             dec.reason = f"options_blocked_by_policy:{options_policy}"
             return dec
-        # minimal policy buying rich premium is allowed but costly — flag it.
         if options_policy == _POLICY_MINIMAL and dec.iv_regime == IVR_HIGH:
             dec.warnings.append("minimal_policy_forces_long_premium_at_high_iv")
         dec.structure = structure
@@ -387,10 +485,10 @@ class OptionsOverlay:
             dec.reason = "non_positive_stop_distance"
             return dec
 
-        # 2) expiration + candidate contracts of the working right
-        right = _right_for(signal.side)
-        # credit spreads use the OPPOSITE right; pull that side's expiration too.
-        work_right = right if structure != STRUCT_CREDIT else ("put" if signal.side == "long" else "call")
+        # 2) expiration + candidate contracts (credit spreads use the OTHER right)
+        work_right = _right_for(signal.side)
+        if structure == STRUCT_CREDIT:
+            work_right = "put" if signal.side == "long" else "call"
         exp, cands = _pick_expiration(
             chain, work_right, as_of,
             int(p["prefer_dte"]), int(p["min_dte"]), int(p["max_dte"]),
@@ -405,58 +503,66 @@ class OptionsOverlay:
         dec.diagnostics["expiration"] = exp
         dec.diagnostics["dte"] = _dte_of(cands[0], as_of)
 
-        # 3) build the structure
-        builder = {
-            STRUCT_LONG: _build_long,
-            STRUCT_DEBIT: _build_debit_vertical,
-            STRUCT_CREDIT: _build_credit_spread,
-        }[structure]
-        built = builder(cands, p, signal.side)
+        # 3) build the structure (+ small-account downgrade to a cheaper ticket)
+        built, structure = self._build(structure, cands, p, signal, equity, dec)
         if built is None:
-            dec.reason = f"could_not_build:{structure}"
+            if not dec.reason:
+                dec.reason = f"could_not_build:{structure}"
             return dec
+        dec.structure = structure
         legs, net_debit, net_credit, max_loss_pc, max_profit_pc, be = built
-        dec.legs = legs
-        dec.net_debit = net_debit
-        dec.net_credit = net_credit
+        dec.legs, dec.net_debit, dec.net_credit = legs, net_debit, net_credit
         dec.max_loss_per_contract = max_loss_pc
         dec.max_profit_per_contract = max_profit_pc
         dec.breakeven = be
 
-        # per-spread greeks (per share): sum of signed leg greeks
         delta_ps = sum(l.sign * l.ratio * l.contract.delta for l in legs)
         theta_ps = sum(l.sign * l.ratio * l.contract.theta for l in legs)
         dec.diagnostics["delta_per_spread"] = round(delta_ps, 4)
         dec.diagnostics["theta_per_spread_per_day"] = round(theta_ps * 100.0, 2)
 
-        # 4) sizing — the conservative minimum of three caps
-        sizing = self._size(
-            equity=equity, dollar_risk=dollar_risk, signal=signal,
-            delta_ps=delta_ps, max_loss_pc=max_loss_pc,
-            outlay_pc=(net_debit if net_debit > 0 else max_loss_pc),
-            policy=options_policy,
-        )
+        # 4) sizing
+        mode = p.get("sizing_mode", SIZE_VOL_TARGET)
+        if mode == SIZE_PREMIUM_RISK:
+            sizing = self._size_premium_risk(equity, max_loss_pc, dollar_risk, options_policy)
+        else:
+            sizing = self._size_vol_target(
+                equity=equity, dollar_risk=dollar_risk, signal=signal,
+                delta_ps=delta_ps, max_loss_pc=max_loss_pc,
+                outlay_pc=(net_debit if net_debit > 0 else max_loss_pc),
+                policy=options_policy,
+            )
         dec.diagnostics.update(sizing["diag"])
         contracts = sizing["contracts"]
 
         if contracts < 1:
             dec.diagnostics["min_viable_equity"] = round(sizing["min_viable_equity"], 2)
             dec.diagnostics["binding_constraint"] = sizing["binding"]
-            if p.get("allow_min_ticket", False):
+            if p.get("allow_min_ticket", False) and sizing.get("affordable", True):
                 contracts = 1
                 dec.warnings.append(
                     f"over_budget_min_ticket:risk={sizing['risk_pct_at_1']:.2%}"
                     f"_vs_budget={dollar_risk / equity:.2%}"
                 )
             else:
-                dec.reason = "sub_one_contract_within_risk_budget"
+                dec.reason = sizing.get("skip_reason", "sub_one_contract_within_risk_budget")
                 return dec
 
         dec.contracts = contracts
         dec.net_delta = round(delta_ps * 100.0 * contracts, 2)
         dec.net_theta = round(theta_ps * 100.0 * contracts, 2)
 
-        # 5) theta gate (only bites long-premium structures; credit is theta+)
+        # true per-trade risk % (defined max loss of the WHOLE position)
+        pos_max_loss = max_loss_pc * contracts
+        risk_pct = pos_max_loss / equity if equity > 0 else float("inf")
+        dec.diagnostics["position_max_loss"] = round(pos_max_loss, 2)
+        dec.diagnostics["risk_pct_of_equity"] = round(risk_pct, 4)
+        if daily_halt_pct is not None and risk_pct * 100.0 > daily_halt_pct:
+            dec.warnings.append(
+                f"ticket_risk_exceeds_daily_halt:{risk_pct:.1%}>{daily_halt_pct:.1f}%"
+            )
+
+        # 5) theta gate (bites long-premium tickets only; credit is theta+)
         self._theta_gate(dec, signal, theta_ps, delta_ps, contracts)
         if not dec.ok and dec.reason:
             return dec
@@ -464,11 +570,57 @@ class OptionsOverlay:
         dec.ok = True
         return dec
 
-    # ------------------------------------------------------------------ sizing
-    def _size(self, *, equity, dollar_risk, signal, delta_ps, max_loss_pc, outlay_pc, policy):
+    # ------------------------------------------------------- structure + downgrade
+    def _build(self, structure, cands, p, signal, equity, dec):
+        """Build the IV-chosen structure; in premium_risk mode downgrade to the
+        cheapest defined-risk ticket that fits the hard risk ceiling."""
+        builder = {
+            STRUCT_LONG: _build_long,
+            STRUCT_DEBIT: _build_debit_vertical,
+            STRUCT_CREDIT: _build_credit_spread,
+        }[structure]
+        primary = builder(cands, p, signal.side)
+
+        mode = p.get("sizing_mode", SIZE_VOL_TARGET)
+        if mode != SIZE_PREMIUM_RISK or not p.get("enable_structure_downgrade", False):
+            return primary, structure
+
+        ceiling = float(p["hard_max_trade_risk_pct"]) * equity
+        if primary is not None and _maxloss(primary) <= ceiling:
+            return primary, structure
+
+        # Downgrade ladder: cheapest defined-risk tickets, in preference order.
+        ladder = [
+            (STRUCT_DEBIT, lambda: _build_narrow_debit(cands, p, signal.side, 1)),
+            (STRUCT_LONG, lambda: _build_cheapest_long(cands, p, signal.side, ceiling)),
+            (STRUCT_CREDIT, lambda: _build_narrow_credit(cands, p, signal.side, 1)),
+        ]
+        for label, make in ladder:
+            alt = make()
+            if alt is not None and _maxloss(alt) <= ceiling:
+                dec.warnings.append(
+                    f"downgraded_to:{label}(max_loss=${_maxloss(alt):.0f}"
+                    f"<=ceiling=${ceiling:.0f})"
+                )
+                return alt, label
+
+        # nothing fits the ceiling -> report the cheapest attempt and skip.
+        cheapest = min(
+            (b for b in [primary] + [m() for _, m in ladder] if b is not None),
+            key=_maxloss, default=None,
+        )
+        if cheapest is not None:
+            dec.diagnostics["cheapest_ticket_max_loss"] = round(_maxloss(cheapest), 2)
+            dec.diagnostics["hard_ceiling"] = round(ceiling, 2)
+            dec.diagnostics["min_viable_equity"] = round(
+                _maxloss(cheapest) / float(p["hard_max_trade_risk_pct"]), 2)
+        dec.reason = "no_defined_risk_ticket_under_ceiling"
+        return None, structure
+
+    # --------------------------------------------------- vol-target sizing
+    def _size_vol_target(self, *, equity, dollar_risk, signal, delta_ps, max_loss_pc, outlay_pc, policy):
         p = self.p
         stop_dist = signal.stop_distance
-        # first-order loss at the underlying stop, capped by the defined max loss
         loss_at_stop_pc = abs(delta_ps) * stop_dist * 100.0
         loss_at_stop_pc = min(loss_at_stop_pc, max_loss_pc) if max_loss_pc > 0 else loss_at_stop_pc
         loss_at_stop_pc = max(loss_at_stop_pc, 1e-9)
@@ -486,25 +638,58 @@ class OptionsOverlay:
         binding = min(caps, key=caps.get)
         contracts = int(min(caps.values()))
 
-        # equity that would make the binding cap reach exactly 1 contract
+        rr = (dollar_risk / equity) if equity > 0 else 0.0
         need = {
-            "vol_target": loss_at_stop_pc / (dollar_risk / equity) if equity > 0 and dollar_risk > 0 else float("inf"),
-            "max_loss": max_loss_pc / (max_loss_mult * (dollar_risk / equity)) if equity > 0 and dollar_risk > 0 else float("inf"),
+            "vol_target": loss_at_stop_pc / rr if rr > 0 else float("inf"),
+            "max_loss": max_loss_pc / (max_loss_mult * rr) if rr > 0 else float("inf"),
             "premium": outlay_pc / max_prem_pct,
         }
-        min_viable_equity = max(need.values())
-
         return {
             "contracts": contracts,
             "binding": binding,
-            "min_viable_equity": min_viable_equity,
+            "min_viable_equity": max(need.values()),
             "risk_pct_at_1": loss_at_stop_pc / equity if equity > 0 else float("inf"),
+            "affordable": True,
             "diag": {
+                "sizing_mode": SIZE_VOL_TARGET,
                 "loss_at_stop_per_contract": round(loss_at_stop_pc, 2),
                 "cap_vol_target": round(vol_target, 3),
                 "cap_max_loss": round(maxloss_cap, 3),
                 "cap_premium": round(premium_cap, 3),
                 "dollar_risk_budget": round(dollar_risk, 2),
+            },
+        }
+
+    # --------------------------------------------- premium-risk (small account)
+    def _size_premium_risk(self, equity, max_loss_pc, dollar_risk, policy):
+        """Risk a fixed % of equity as premium-at-risk (a defined-risk ticket's
+        max loss). This is the honest small-account options unit."""
+        p = self.p
+        target_pct = float(p.get("max_trade_risk_pct", 0.0) or 0.0)
+        budget = target_pct * equity if target_pct > 0 else dollar_risk
+        hard_pct = float(p["hard_max_trade_risk_pct"])
+        if policy in (_POLICY_MINIMAL, _POLICY_DEFINED_RISK_SMALL):
+            hard_pct = min(hard_pct, float(p.get("small_hard_max_trade_risk_pct", hard_pct)))
+        ceiling = hard_pct * equity
+        ml = max(max_loss_pc, 1e-9)
+
+        affordable = ml <= ceiling
+        contracts = int(budget / ml) if affordable else 0
+        if affordable:
+            contracts = max(contracts, 1)  # one ticket already fits the ceiling
+
+        return {
+            "contracts": contracts,
+            "binding": "premium_risk" if affordable else "hard_ceiling",
+            "min_viable_equity": ml / hard_pct,
+            "risk_pct_at_1": ml / equity if equity > 0 else float("inf"),
+            "affordable": affordable,
+            "skip_reason": "ticket_exceeds_hard_risk_ceiling",
+            "diag": {
+                "sizing_mode": SIZE_PREMIUM_RISK,
+                "premium_risk_budget": round(budget, 2),
+                "hard_risk_ceiling": round(ceiling, 2),
+                "max_loss_per_contract": round(max_loss_pc, 2),
             },
         }
 
@@ -514,7 +699,6 @@ class OptionsOverlay:
         hold = float(p["intraday_hold_fraction"])
         theta_cost = abs(theta_ps * 100.0 * contracts) * hold
         dec.diagnostics["theta_cost_over_hold"] = round(theta_cost, 2)
-        # credit spreads / any net-positive-theta ticket: decay is a tailwind.
         if theta_ps >= 0:
             dec.diagnostics["theta_to_edge"] = 0.0
             return

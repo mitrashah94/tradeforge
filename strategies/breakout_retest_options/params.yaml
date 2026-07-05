@@ -28,7 +28,21 @@ defaults:
   max_spread_pct: 0.12             # reject a leg whose bid/ask spread > 12% of mid
   min_open_interest: 100           # skip illiquid strikes (0 disables)
 
-  # ---- sizing caps (the size is the conservative MIN of all three) -------
+  # ---- session window gate ----------------------------------------------
+  session_open_et: "09:30"         # RTH open (Eastern)
+  session_first_n_minutes: 0       # 0 = no gate; 90 = only the opening 90 minutes
+
+  # ---- sizing mode -------------------------------------------------------
+  # vol_target  : equity-strategy discipline (size $-loss at the underlying stop
+  #               to ~1% of equity). On a small account this rounds to 0 SPY/QQQ
+  #               contracts -> honest SKIP with min_viable_equity.
+  # premium_risk: the small-account options unit — risk a fixed % of equity as
+  #               premium-at-risk (a defined-risk ticket's max loss); steer to the
+  #               cheapest structure that fits (see the small_account_first90
+  #               profile). Widens per-trade risk LOUDLY, never silently.
+  sizing_mode: vol_target
+
+  # ---- vol_target sizing caps (size = conservative MIN of all three) ------
   # 1) vol-target: contracts so $-loss at the underlying stop == dollar_risk.
   # 2) max-loss:   worst-case defined loss <= max_loss_mult * dollar_risk.
   # 3) premium:    cash outlay / collateral <= max_premium_pct * equity.
@@ -37,11 +51,42 @@ defaults:
   small_max_premium_pct_of_equity: 0.10   # tighter cap under 'minimal'/'defined_risk_small'
 
   # On a tiny account (see playbook: $1k can't size 1 SPY/QQQ contract inside a
-  # ~$12 budget) the overlay SKIPS by default and reports min_viable_equity.
-  # Flip this to force exactly one defined-risk contract, stamped over_budget.
+  # ~$12 budget) vol_target SKIPS and reports min_viable_equity. Flip this to
+  # force exactly one defined-risk contract, stamped over_budget.
   allow_min_ticket: false
+
+  # ---- premium_risk sizing (small account) -------------------------------
+  max_trade_risk_pct: 0.0          # target premium-at-risk / trade (frac of equity); 0 => use dollar_risk
+  hard_max_trade_risk_pct: 0.15    # SKIP if one defined-risk ticket's max loss exceeds this frac
+  small_hard_max_trade_risk_pct: 0.10   # tighter ceiling under 'minimal'/'defined_risk_small'
+  enable_structure_downgrade: false     # steer an unaffordable ATM outright -> cheapest defined-risk ticket
 
   # ---- theta gate (bites long-premium tickets only; credit is theta+) ----
   intraday_hold_fraction: 0.5      # fraction of a calendar day of theta we budget for
   max_theta_to_edge: 0.35          # reject if theta over the hold > 35% of move-to-target edge
   reject_on_theta_gate: true       # false -> warn but keep the ticket
+
+# ------------------------------------------------------------------------- #
+# Named profiles (defaults + a delta). Select with load_params("<name>").
+# ------------------------------------------------------------------------- #
+profiles:
+  # The $1,000 / opening-90-minutes options profile. Trades ONLY the first 90
+  # minutes, allows 0DTE (the cheap intraday vehicle), sizes by premium-at-risk,
+  # and downgrades an unaffordable ATM outright to the cheapest defined-risk
+  # ticket (1-wide vertical / low-delta long) that fits the hard risk ceiling.
+  # HONEST: on $1k a viable SPY/QQQ ticket risks ~6-12% of the account — far
+  # above the 1% rule and above the RI daily halt. That is a deliberate,
+  # surfaced choice (defined-risk only, first-90-min only, 1-2 trades/day, hard
+  # daily stop). The overlay flags it via ticket_risk_exceeds_daily_halt.
+  small_account_first90:
+    session_first_n_minutes: 90
+    sizing_mode: premium_risk
+    max_trade_risk_pct: 0.06       # aim ~6% of equity of premium-at-risk / trade
+    hard_max_trade_risk_pct: 0.12  # never more than ~12% on one ticket
+    enable_structure_downgrade: true
+    min_dte: 0                     # allow 0DTE
+    prefer_dte: 0
+    max_dte: 2
+    intraday_hold_fraction: 0.20   # ~90-min hold, not half a day
+    max_spread_pct: 0.15           # opening-range spreads are a touch wider
+    allow_min_ticket: false

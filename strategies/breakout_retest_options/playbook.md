@@ -58,39 +58,70 @@ Read straight from `risk/limits.yaml → level(ri).options`:
 | `defined_risk_small` | 5 | all three structures (all are defined-risk), small size cap |
 | `ok` | 6–8 | all three, normal size cap |
 
-## Sizing — three caps, take the minimum
+## Two sizing modes
+
+### `vol_target` (default) — the equity-strategy discipline
 
 Contracts = `floor(min(vol_target, max_loss, premium))`:
 
 1. **vol-target** — contracts so the first-order $-loss at the *underlying* stop
-   (`|delta| · stop_distance · 100`) equals the per-trade `dollar_risk`. Same
-   risk discipline as the equity strategy: you exit at the technical stop.
-2. **max-loss** — worst-case *defined* loss ≤ `max_loss_mult · dollar_risk`
-   (options gap; the stop may not fill at the modeled price).
+   (`|delta| · stop_distance · 100`) equals the per-trade `dollar_risk`.
+2. **max-loss** — worst-case *defined* loss ≤ `max_loss_mult · dollar_risk`.
 3. **premium** — cash outlay / collateral ≤ `max_premium_pct · equity`.
 
-## The $1,000 reality (why this overlay mostly says "skip")
-
-This is the honest, load-bearing finding for a small account — the overlay
-surfaces it instead of hiding it behind a rounded-up 1-lot:
+On a small account this rounds to **zero** SPY/QQQ contracts and the overlay
+honestly **skips**, reporting `min_viable_equity`:
 
 | Account | RI / policy | Per-trade risk | 1× SPY 500c (debit ~$310) | Verdict |
 |---------|-------------|----------------|---------------------------|---------|
-| **$1,000** | RI-6 `ok` (1.25%) | **$12.50** | worst-case loss $310 = **24.8× budget** | **SKIP** — needs ~**$24,800** for 1 contract |
-| **$1,000** | RI-4 `minimal` (0.75%) | **$7.50** | worst-case loss $310 = **41× budget** | **SKIP** — needs ~**$41,300** |
-| **$100,000** | RI-6 `ok` (1.25%) | $1,250 | 4 contracts within all caps | **OK** |
+| $1,000 | RI-6 `ok` (1.25%) | $12.50 | worst-case $310 = 24.8× budget | SKIP — needs ~$24,800 |
+| $1,000 | RI-4 `minimal` (0.75%) | $7.50 | $310 = 41× budget | SKIP — needs ~$41,300 |
+| $100,000 | RI-6 `ok` (1.25%) | $1,250 | 4 contracts | OK |
 
-One SPY/QQQ contract's worst-case loss ($30–$300+) dwarfs a disciplined 1%-of-$1k
-per-trade budget. So on a $1,000 account the overlay **skips and reports
-`min_viable_equity`** plus the binding constraint. This is the cost-viability
-floor from CLAUDE.md in action: *raise selectivity, never widen risk.* The
-mitigations it points at — cheaper defined-risk spreads (lower per-contract max
-loss), lower-delta strikes, or simply waiting until equity compounds past the
-`min_viable_equity` — are all "trade less / trade smaller," never "risk more."
+This is the CLAUDE.md cost-viability floor: *raise selectivity, never widen
+risk.* But it answers "can I 1%-risk SPY options on $1k?" — **no** — not "can I
+trade options on $1k at all."
 
-`allow_min_ticket: true` (default **false**) overrides the skip to take exactly
-one defined-risk contract, stamped `over_budget` with the actual risk %, for
-explicit paper study only.
+### `premium_risk` — the small-account options unit (the `small_account_first90` profile)
+
+The honest way a $1,000 account actually trades options: the risk unit is the
+**premium you can lose** on a *defined-risk* ticket, sized as a fixed % of
+equity — not 1%-at-the-underlying-stop. The profile:
+
+- **trades only the opening 90 minutes** (`session_first_n_minutes: 90`) — the
+  high-liquidity, high-participation window break-and-retest lives in; the signal
+  must carry `time_et`;
+- **allows 0DTE** (`min_dte: 0`) — the cheap intraday vehicle — with a ~90-minute
+  theta hold (`intraday_hold_fraction: 0.20`), so decay drag is modest early;
+- **sizes by premium-at-risk**: `contracts = floor(max_trade_risk_pct·equity /
+  ticket_max_loss)`, with a hard ceiling `hard_max_trade_risk_pct·equity`;
+- **downgrades to the cheapest defined-risk ticket** when the IV-preferred
+  structure is unaffordable: ATM outright → 1-wide debit vertical → low-delta
+  long → 1-wide credit spread. It will **not** let you nuke 31% on one ATM call.
+
+Worked $1,000 example (low IV, long signal at 10:05):
+
+| Step | Result |
+|------|--------|
+| IV-preferred | long ATM 500c — **$310 debit = 31%** ✗ over ceiling |
+| downgraded to | **1-wide 500/501 debit vertical** — $65 max loss |
+| size | **1 contract**, position max loss **$65 = 6.5%** of $1k |
+| flags | `downgraded_to:debit_vertical`, `ticket_risk_exceeds_daily_halt:6.5%>2.5%` |
+
+**The unavoidable truth, stated plainly:** the cheapest sane SPY/QQQ
+defined-risk ticket risks **~6–12% of a $1,000 account** — several times the RI
+daily-halt (2.5%). The overlay does not hide this; it **widens risk loudly**
+(`risk_pct_of_equity` in diagnostics, `ticket_risk_exceeds_daily_halt` warning).
+Trading options on $1k is only defensible with the guardrails baked into the
+profile: **defined-risk only, opening-90-min only, 1–2 tickets/day, and a hard
+daily stop after the first loser** (one $65 loss ≈ a normal day's halt). If even
+the cheapest ticket exceeds the hard ceiling, the overlay still skips with
+`no_defined_risk_ticket_under_ceiling` + `min_viable_equity`.
+
+> Alternative worth weighing: the reason a ticket is ~7% of equity is that
+> SPY/QQQ are ~$500–600 underlyings. A cheaper liquid optionable underlying
+> makes each contract a smaller slice of $1k and lets the RI halts breathe — at
+> the cost of leaving the SPY/QQQ break-retest universe.
 
 ## Status
 

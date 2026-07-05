@@ -100,10 +100,14 @@ strategies:
       strikes; a theta gate blocks long-premium bleed; the RI options policy
       (limits.yaml level(ri).options) gates permission + size. It carries NO
       independent edge — it inherits breakout_retest's trigger and must clear the
-      paper->live gates on OPTIONS-realistic costs before anything goes live. Key
-      honest finding: at $1k a per-trade budget (~$12 at RI-6) cannot size even
-      one SPY/QQQ contract (worst-case loss ~$300); the overlay SKIPS and reports
-      min_viable_equity (~$25k) rather than over-risking a 1-lot. See
+      paper->live gates on OPTIONS-realistic costs before anything goes live. Two
+      sizing modes: vol_target (1%-at-stop discipline; SKIPS on $1k and reports
+      min_viable_equity ~$25k) and premium_risk (the small_account_first90
+      profile — opening-90-min only, 0DTE-capable, sizes by premium-at-risk and
+      downgrades an unaffordable ATM to the cheapest defined-risk ticket). Honest
+      finding surfaced, not hidden: the cheapest viable SPY/QQQ ticket risks
+      ~6-12% of a $1k account (> the RI daily halt), flagged via
+      ticket_risk_exceeds_daily_halt. See
       strategies/breakout_retest_options/playbook.md.
 
 # Live correlation matrix (full-period realistic daily fractional returns, QQQ 5m,

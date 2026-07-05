@@ -239,3 +239,94 @@ def test_dte_window_excludes_out_of_range_expirations():
                     options_policy="ok", dollar_risk=1250.0, ri=6, as_of=AS_OF)
     assert not dec.ok
     assert dec.reason == "no_expiration_in_dte_window"
+
+
+# =========================================================================== #
+# small_account_first90 profile — $1,000, opening-90-minutes options trading
+# =========================================================================== #
+def _first90():
+    return OptionsOverlay(load_params("small_account_first90"))
+
+
+def _timed_signal(time_et, spot=500.0, stop=499.2, target=501.6):
+    return UnderlyingSignal("SPY", "long", spot, stop, target, "B", time_et=time_et)
+
+
+def test_profile_loads_small_account_first90():
+    p = load_params("small_account_first90")
+    assert p["_profile"] == "small_account_first90"
+    assert p["session_first_n_minutes"] == 90
+    assert p["sizing_mode"] == "premium_risk"
+    assert p["min_dte"] == 0                    # 0DTE allowed intraday
+    assert p["enable_structure_downgrade"] is True
+
+
+def test_unknown_profile_raises():
+    with pytest.raises(KeyError):
+        load_params("nope")
+
+
+def test_session_gate_blocks_outside_first_90_minutes():
+    ov = _first90()
+    dec = ov.select(_timed_signal("13:00"), _chain(), iv_rank=0.10, equity=1000.0,
+                    options_policy="ok", dollar_risk=12.5, ri=6, as_of=AS_OF)
+    assert not dec.ok
+    assert dec.reason == "outside_first_90min_window"
+
+
+def test_session_gate_allows_inside_window():
+    ov = _first90()
+    dec = ov.select(_timed_signal("09:31"), _chain(), iv_rank=0.10, equity=1000.0,
+                    options_policy="ok", dollar_risk=12.5, ri=6, as_of=AS_OF)
+    assert dec.reason != "outside_first_90min_window"
+
+
+def test_session_gate_warns_when_no_time_given():
+    ov = _first90()
+    dec = ov.select(_timed_signal(None), _chain(), iv_rank=0.10, equity=1000.0,
+                    options_policy="ok", dollar_risk=12.5, ri=6, as_of=AS_OF)
+    assert "session_gate_enabled_but_no_signal_time" in dec.warnings
+
+
+def test_thousand_dollar_first90_downgrades_to_affordable_defined_risk_ticket():
+    """The heart of it: $1k CAN trade — the ATM outright ($310, 31%) is
+    downgraded to a cheap 1-wide debit vertical sized to premium-at-risk."""
+    limits = load_limits()
+    dec = _first90().select(
+        _timed_signal("10:05"), _chain(), iv_rank=0.10, equity=1000.0,
+        options_policy="ok", dollar_risk=per_trade_dollar_risk(1000.0, 6, limits),
+        ri=6, as_of=AS_OF, daily_halt_pct=limits.level(6).daily_halt_pct,
+    )
+    assert dec.ok
+    assert dec.structure == STRUCT_DEBIT
+    assert dec.contracts == 1
+    assert dec.max_loss_per_contract <= 0.12 * 1000.0     # within the hard ceiling
+    assert dec.diagnostics["sizing_mode"] == "premium_risk"
+    assert any(w.startswith("downgraded_to") for w in dec.warnings)
+    # honest: the ticket risks MORE than the RI daily halt, and it is flagged.
+    assert dec.diagnostics["risk_pct_of_equity"] > 0.025
+    assert any(w.startswith("ticket_risk_exceeds_daily_halt") for w in dec.warnings)
+
+
+def test_first90_skips_when_nothing_fits_hard_ceiling():
+    # A punishing 2% hard ceiling ($20 on $1k) — no SPY ticket fits -> honest skip.
+    p = load_params("small_account_first90")
+    p["hard_max_trade_risk_pct"] = 0.02
+    dec = OptionsOverlay(p).select(
+        _timed_signal("10:05"), _chain(), iv_rank=0.10, equity=1000.0,
+        options_policy="ok", dollar_risk=12.5, ri=6, as_of=AS_OF,
+    )
+    assert not dec.ok
+    assert dec.reason == "no_defined_risk_ticket_under_ceiling"
+    assert dec.diagnostics["min_viable_equity"] > 1000.0
+
+
+def test_first90_premium_risk_sizes_multiple_contracts_when_affordable():
+    # Enough equity that the 6% premium-risk budget clears 2x the ATM debit.
+    dec = _first90().select(
+        _timed_signal("10:05"), _chain(), iv_rank=0.10, equity=12_000.0,
+        options_policy="ok", dollar_risk=150.0, ri=6, as_of=AS_OF,
+    )
+    assert dec.ok
+    assert dec.contracts >= 2                   # budget 6%*$12k=$720 vs ~$310 debit
+    assert dec.net_delta > 0
