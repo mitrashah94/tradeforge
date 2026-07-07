@@ -112,13 +112,18 @@ def build_levels(daily: pd.DataFrame, sess: date) -> dict:
 # --------------------------------------------------------------------------- #
 # Small-account fractional sizing (vol-target, buying-power-capped)
 # --------------------------------------------------------------------------- #
-def size_trade(equity: float, entry: float, stop: float, limits, grade="B") -> dict:
-    ri = resolve_ri(grade, limits)
+def size_trade(equity: float, entry: float, stop: float, limits, *,
+               ri: int | None = None, grade: str = "B",
+               intraday_leverage: float = 4.0) -> dict:
+    if ri is None:
+        ri = resolve_ri(grade, limits)
     lvl = limits.level(ri)
     sr = vol_target_qty(equity=equity, ri=ri, limits=limits, entry_price=entry,
                         stop_price=stop, allow_fractional=True)
     ideal = sr.qty
-    leverage = lvl.leverage_max or 1.0
+    # leverage_max is null at RI 8 ("up to broker intraday max") -> use the
+    # configured RegT day-trading buying power (default 4x).
+    leverage = lvl.leverage_max if lvl.leverage_max is not None else intraday_leverage
     bp_cap = equity * leverage / entry           # fractional shares affordable
     shares = min(ideal, bp_cap)
     binding = "risk_budget" if ideal <= bp_cap else "buying_power"
@@ -134,7 +139,8 @@ def size_trade(equity: float, entry: float, stop: float, limits, grade="B") -> d
 # Run
 # --------------------------------------------------------------------------- #
 def run(symbol: str, intraday: str, daily_path: str, sess: date | None,
-        equity: float) -> dict:
+        equity: float, *, ri: int | None = None, grade: str = "B",
+        intraday_leverage: float = 4.0) -> dict:
     daily = _daily_df(daily_path, symbol)
     if sess is None:
         # last intraday session present
@@ -153,7 +159,8 @@ def run(symbol: str, intraday: str, daily_path: str, sess: date | None,
     limits = load_limits()
     trades = []
     for t in res.trades.itertuples(index=False):
-        sizing = size_trade(equity, float(t.entry_price), float(t.stop), limits)
+        sizing = size_trade(equity, float(t.entry_price), float(t.stop), limits,
+                            ri=ri, grade=grade, intraday_leverage=intraday_leverage)
         sign = 1.0 if t.side == "long" else -1.0
         pnl = sizing["shares"] * (float(t.exit_price) - float(t.entry_price)) * sign
         trades.append({
@@ -165,8 +172,9 @@ def run(symbol: str, intraday: str, daily_path: str, sess: date | None,
             "sizing": sizing, "pnl": round(pnl, 2), "return_pct": round(pnl / equity, 4),
         })
 
+    eff_ri = ri if ri is not None else resolve_ri(grade, limits)
     return {"symbol": symbol, "session": str(sess), "equity": equity,
-            "variant": VARIANT, "cost_profile": COST_PROFILE,
+            "variant": VARIANT, "cost_profile": COST_PROFILE, "ri": eff_ri,
             "levels": {k: (round(v, 2) if isinstance(v, float) else v)
                        for k, v in levels.items()},
             "n_trades": len(trades), "trades": trades}
@@ -186,7 +194,7 @@ def digest(report: dict) -> str:
     L = report["levels"]
     lines = [
         f"── PAPER {report['symbol']} {report['session']}  "
-        f"[{report['variant']} · {report['cost_profile']} · ${report['equity']:,.0f}]",
+        f"[{report['variant']} · {report['cost_profile']} · ${report['equity']:,.0f} · RI{report['ri']}]",
         f"   levels: PDH={L['pdh']} PDL={L['pdl']} ATR14(Wilder,daily)={L['atr14']}",
     ]
     if report["n_trades"] == 0:
@@ -218,11 +226,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--daily", required=True, help=">=15 daily bars JSON (same shape)")
     ap.add_argument("--date", default=None, help="trade session YYYY-MM-DD (default: last in intraday)")
     ap.add_argument("--equity", type=float, default=1000.0)
+    ap.add_argument("--ri", type=int, default=None, help="explicit risk index (else resolved from --grade)")
+    ap.add_argument("--grade", default="B", help="conviction grade B/A/A+ (used when --ri omitted)")
+    ap.add_argument("--intraday-leverage", type=float, default=4.0,
+                    help="buying-power multiple when the RI's leverage_max is null (RI 8)")
     ap.add_argument("--journal-dir", default="paper/paper_today")
     args = ap.parse_args(argv)
 
     sess = date.fromisoformat(args.date) if args.date else None
-    report = run(args.symbol, args.intraday, args.daily, sess, args.equity)
+    report = run(args.symbol, args.intraday, args.daily, sess, args.equity,
+                 ri=args.ri, grade=args.grade, intraday_leverage=args.intraday_leverage)
     print(digest(report))
     p = journal(report, Path(args.journal_dir))
     print(f"\n   journaled → {p}   (PAPER/RESEARCH only — no orders placed)")

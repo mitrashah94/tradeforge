@@ -81,6 +81,19 @@ def test_size_trade_buying_power_capped_on_high_priced_underlying():
     assert s["actual_risk_pct"] < limits.level(s["ri"]).per_trade_pct / 100.0
 
 
+def test_ri8_uses_intraday_leverage_when_leverage_max_null():
+    # RI 8 has leverage_max: null ("up to broker intraday max") -> the configured
+    # intraday leverage (default 4x) sets buying power, not 1x.
+    limits = load_limits()
+    assert limits.level(8).leverage_max is None
+    s = size_trade(1000.0, entry=751.0, stop=748.5, limits=limits, ri=8,
+                   intraday_leverage=4.0)
+    assert s["ri"] == 8
+    assert s["bp_cap_shares"] == pytest.approx(1000.0 * 4.0 / 751.0, abs=1e-3)
+    assert s["risk_budget"] == pytest.approx(20.0)          # 2% of $1k at RI 8
+    assert s["binding"] == "buying_power"
+
+
 def test_run_flat_session_when_no_break(tmp_path):
     daily = _daily("QQQ", tmp_path)
     # session entirely below PDH=100 -> no break -> no trade
