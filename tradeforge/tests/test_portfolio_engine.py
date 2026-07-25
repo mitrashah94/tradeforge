@@ -29,6 +29,8 @@ from backtest.daily.portfolio_backtester import run_portfolio
 from portfolio.config import load_portfolio_config
 from portfolio.engine import PortfolioEngine
 from portfolio.model import BookState, DayBars, OpenLot, SleeveSpec
+from risk.config import load_limits
+from risk.sizing import per_trade_dollar_risk, resolve_ri
 
 
 # --------------------------------------------------------------------------- #
@@ -66,6 +68,27 @@ def _small_synth_pcfg():
     pcfg = load_portfolio_config()
     object.__setattr__(pcfg.synthetic_stop, "window", 2)
     return pcfg
+
+
+def _limits_with_min_concurrent(n):
+    """A test-local copy of the real risk/limits.yaml with the operator's current
+    floor row's max_concurrent raised to at least ``n``.
+
+    Used only to isolate multi-sleeve OPEN mechanics (exact share counts,
+    exposure) from the book's concurrency cap, which has its own dedicated
+    tests (test_heat_cap_limits_concurrent_opens /
+    test_portfolio_budget::test_concurrency_cap_stops_walk). Every other
+    config value -- per_trade_pct, heat, halts -- stays exactly what the
+    operator set in risk/limits.yaml; this never touches the file itself.
+    """
+    limits = load_limits()
+    row = limits.table[limits.default_ri]
+    if row.max_concurrent >= n:
+        return limits
+    new_row = row.model_copy(update={"max_concurrent": n})
+    table = dict(limits.table)
+    table[limits.default_ri] = new_row
+    return limits.model_copy(update={"table": table})
 
 
 def _corr(mapping):
@@ -115,15 +138,22 @@ def test_multi_sleeve_opens_exact_shares():
         SleeveSpec(name="rot", strategy=WantFrom({"CCC": 0.2}, frm), kind="weight",
                    grade="B", family="equity"),
     ]
+    # 3 concurrent opens need max_concurrent >= 3 at the book's current floor row
+    # (see _limits_with_min_concurrent); every dollar amount below is still
+    # read straight from that config, not hardcoded.
+    limits = _limits_with_min_concurrent(3)
     res = run_portfolio(sleeves, ["AAA", "BBB", "CCC"], initial_equity=100_000.0,
-                        pcfg=_small_synth_pcfg(), panel=panel)
+                        pcfg=_small_synth_pcfg(), panel=panel, limits=limits)
     # Reconstruct holdings from the engine via a fresh run capturing the book.
     # Simplest: assert exposure + that all three names traded (open or held).
-    # Equity 100k; AAA risk 1.25%*100k=1250 / rps 5 = 250 sh; BBB/CCC 0.2*100k/500 = 40 sh.
+    # AAA risk = per_trade_dollar_risk(equity, resolve_ri("B", limits), limits) / rps(5);
+    # BBB/CCC 0.2*100k/500 = 40 sh each.
     # Mark-to-close on the final bar with flat prices -> NAV ~ 100k (minus costs).
     assert res.nav.iloc[-1] == pytest.approx(100_000.0, rel=2e-3)
-    # exposure on the entry day onward is (250*100 + 40*500 + 40*500)/100k = 0.65.
-    assert res.exposure.iloc[-1] == pytest.approx(0.65, rel=2e-2)
+    aaa_dollar_risk = per_trade_dollar_risk(100_000.0, resolve_ri("B", limits), limits)
+    aaa_shares = aaa_dollar_risk / 5.0
+    expected_exposure = (aaa_shares * 100.0 + 40.0 * 500.0 + 40.0 * 500.0) / 100_000.0
+    assert res.exposure.iloc[-1] == pytest.approx(expected_exposure, rel=2e-2)
 
 
 def test_multi_sleeve_book_state_exact():
@@ -146,7 +176,9 @@ def test_multi_sleeve_book_state_exact():
         SleeveSpec(name="rot", strategy=WantFrom({"CCC": 0.2}, frm), kind="weight",
                    grade="B", family="equity"),
     ]
-    eng = PortfolioEngine(sleeves, pcfg=pcfg)
+    # 3 concurrent opens need max_concurrent >= 3 at the book's current floor row.
+    limits = _limits_with_min_concurrent(3)
+    eng = PortfolioEngine(sleeves, pcfg=pcfg, limits=limits)
     book = BookState(cash=100_000.0, peak_equity=100_000.0, month_start_equity=100_000.0,
                      week_start_equity=100_000.0, prev_nav=100_000.0)
     entry_alloc = None
@@ -158,15 +190,17 @@ def test_multi_sleeve_book_state_exact():
         if d == frm:
             entry_alloc = alloc
     # Assert the EXACT hand-computed opens on the entry day (before any reconcile
-    # drift as cash/equity shifts): AAA risk 1.25%*100k=1250 / rps 5 -> 250 sh;
-    # BBB/CCC 0.2*100k/500 -> 40 sh each.
+    # drift as cash/equity shifts): AAA risk = per_trade_dollar_risk(equity,
+    # resolve_ri("B", limits), limits) / rps(5); BBB/CCC 0.2*100k/500 -> 40 sh each.
+    aaa_dollar_risk = per_trade_dollar_risk(100_000.0, resolve_ri("B", limits), limits)
+    aaa_shares = aaa_dollar_risk / 5.0
     opens = {o.symbol: o for o in entry_alloc.opens}
-    assert opens["AAA"].shares == pytest.approx(250.0)
+    assert opens["AAA"].shares == pytest.approx(aaa_shares)
     assert opens["AAA"].stop == pytest.approx(95.0)
     assert opens["BBB"].shares == pytest.approx(40.0)
     assert opens["CCC"].shares == pytest.approx(40.0)
     assert {s: l.sleeve for s, l in book.lots.items()} == {"AAA": "brk", "BBB": "mr", "CCC": "rot"}
-    assert book.lots["AAA"].shares == pytest.approx(250.0)  # score lot: no reconcile drift
+    assert book.lots["AAA"].shares == pytest.approx(aaa_shares)  # score lot: no reconcile drift
 
 
 # --------------------------------------------------------------------------- #
@@ -237,7 +271,10 @@ def test_cluster_dedup_only_top_opens():
 def test_heat_cap_limits_concurrent_opens():
     idx = _bdays(5)
     frm = idx[2]
-    # three A+ score names, each $2000 risk -> 4% book cap ($4000) admits exactly 2.
+    # three A+ score names, each fixed at RI8's per_trade_pct of equity (A+'s
+    # base tier IS band_high, so it resolves to RI8 regardless of the
+    # operator's floor). How many fit under the CURRENT book heat cap (also
+    # clamped by max_concurrent) is derived from config, not hardcoded.
     syms = ["AAA", "BBB", "CCC"]
     panel = _panel({s: [(100, 101, 99, 100)] * 5 for s in syms})
     close = panel["close"]
@@ -251,6 +288,13 @@ def test_heat_cap_limits_concurrent_opens():
     # distinct families so the per-family cap never binds; book heat is the gate.
     sleeves = [SleeveSpec(name="brk", strategy=AllThree(), kind="score", grade="A+",
                           family="trend", bracket=BracketConfig(atr_window=2))]
+    limits = load_limits()
+    row = limits.level(limits.default_ri)
+    cand_risk = per_trade_dollar_risk(100_000.0, resolve_ri("A+", limits), limits)
+    heat_cap = row.portfolio_heat_pct / 100.0 * 100_000.0
+    n_admit = min(int(heat_cap // cand_risk), row.max_concurrent, len(syms))
+    assert n_admit >= 1, "test setup: no A+ candidate fits under this config's heat cap"
+
     eng = PortfolioEngine(sleeves, pcfg=_small_synth_pcfg())
     book = BookState(cash=100_000.0, peak_equity=100_000.0, month_start_equity=100_000.0,
                      week_start_equity=100_000.0, prev_nav=100_000.0)
@@ -262,10 +306,12 @@ def test_heat_cap_limits_concurrent_opens():
         alloc = eng.step(d, DailyHistory(close, d), bars, book)
         if d == frm:
             break
-    # exactly 2 of the 3 admitted; the lowest-ranked rejected on the heat cap.
-    assert len(book.lots) == 2
-    assert {"AAA", "BBB"} == set(book.lots)
-    assert any("heat cap" in why for _c, why in alloc.rejected)
+    # the top-n_admit-ranked names are admitted (AAA=3.0 > BBB=2.0 > CCC=1.0).
+    expected = set(syms[:n_admit])
+    assert len(book.lots) == n_admit
+    assert expected == set(book.lots)
+    if n_admit < len(syms):
+        assert any("heat cap" in why or "concurrency" in why for _c, why in alloc.rejected)
 
 
 # --------------------------------------------------------------------------- #
@@ -358,8 +404,11 @@ def test_score_lot_tp1_moves_stop_to_breakeven():
     assert "AAA" in book.lots
     assert book.lots["AAA"].tp1_done is True
     assert book.lots["AAA"].stop >= 100.0
-    # entry size = 1.25% RI6 * 100k / rps 5 = 250 sh; half (125) scaled out -> 125 left.
-    assert book.lots["AAA"].shares == pytest.approx(125.0)
+    # entry size = per_trade_dollar_risk(equity, resolve_ri("B", limits), limits) / rps(5);
+    # tp1_fraction=0.5 (set in the bracket config above) scales half out.
+    limits = load_limits()
+    entry_shares = per_trade_dollar_risk(100_000.0, resolve_ri("B", limits), limits) / 5.0
+    assert book.lots["AAA"].shares == pytest.approx(entry_shares * 0.5)
 
 
 # --------------------------------------------------------------------------- #

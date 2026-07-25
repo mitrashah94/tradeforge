@@ -9,6 +9,8 @@ contract end-to-end (no live route).
 
 from __future__ import annotations
 
+import pytest
+
 from portfolio.intents import (
     allocation_to_intents,
     close_to_intent,
@@ -16,28 +18,40 @@ from portfolio.intents import (
     resize_to_intent,
 )
 from portfolio.model import Allocation, PlannedClose, PlannedOpen, PlannedResize
+from risk.config import load_limits
+from risk.sizing import per_trade_dollar_risk, resolve_ri
+
+_EQUITY = 100_000.0
+_ENTRY, _STOP = 100.0, 95.0  # stop_distance_pct = 0.05
 
 
 def _open():
-    # 250 sh @ 100, stop 95 -> stop_distance 5% -> trade risk 250*100*0.05 = 1250
-    # = exactly RI6's 1.25% per-trade cap on $100k. Grade B.
+    # Sized exactly at grade B's resolved-RI cap for whatever floor the
+    # operator currently has set in risk/limits.yaml -- shares = cap /
+    # (entry * stop_distance_pct), a boundary case for the gateway check below.
+    limits = load_limits()
+    cap = per_trade_dollar_risk(_EQUITY, resolve_ri("B", limits), limits)
+    stop_distance_pct = (_ENTRY - _STOP) / _ENTRY
+    shares = cap / (_ENTRY * stop_distance_pct)
     return PlannedOpen(sleeve="brk", symbol="AAA", kind="score", side="long",
-                       shares=250.0, entry_price=100.0, grade="B", family="trend",
-                       dollar_risk=1250.0, stop=95.0, atr=2.0)
+                       shares=shares, entry_price=_ENTRY, grade="B", family="trend",
+                       dollar_risk=cap, stop=_STOP, atr=2.0)
 
 
 def test_open_intent_carries_risk_fields_and_passes_the_gateway_gate():
-    intent = open_to_intent(_open(), equity=100_000.0)
+    limits = load_limits()
+    cap = per_trade_dollar_risk(_EQUITY, resolve_ri("B", limits), limits)
+    stop_distance_pct = (_ENTRY - _STOP) / _ENTRY
+    expected_qty = cap / (_ENTRY * stop_distance_pct)
+
+    intent = open_to_intent(_open(), equity=_EQUITY)
     assert intent["side"] == "buy" and intent["reason"] == "entry"
-    assert intent["qty"] == 250.0
-    assert intent["stop_distance_pct"] == 0.05
-    assert intent["order_notional"] == 25_000.0
+    assert intent["qty"] == pytest.approx(expected_qty)
+    assert intent["stop_distance_pct"] == pytest.approx(stop_distance_pct)
+    assert intent["order_notional"] == pytest.approx(expected_qty * _ENTRY)
     assert intent["bypasses_halt"] is False
 
     # Drive the real gateway risk check: a correctly-sized open must NOT be vetoed.
-    from risk.config import load_limits
-    from risk.sizing import per_trade_dollar_risk, resolve_ri
-    limits = load_limits()
     ri = resolve_ri(intent["grade"], limits)
     cap = per_trade_dollar_risk(intent["equity"], ri, limits)
     trade_risk = intent["order_notional"] * intent["stop_distance_pct"]

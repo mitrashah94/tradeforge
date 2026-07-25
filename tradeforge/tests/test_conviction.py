@@ -6,15 +6,16 @@ from risk.sizing import resolve_ri
 
 def test_grade_maps_to_base_ri():
     limits = load_limits()
-    # The live floor is risk_index.default (now 6 — the operator's "start at RI 6"
-    # decision), and resolve_ri clamps the base tier UP to that floor. So a B
-    # setup, whose BASE RI is 5, now resolves to 6; pass an explicit floor=5 to
-    # observe the raw base mapping. A (6) and A+ (8) already sit at/above the floor.
-    assert limits.conviction_tiers["B"] == 5         # base tier value unchanged
-    assert resolve_ri("B", limits, floor=5) == 5     # raw base mapping (floor permitting)
-    assert resolve_ri("B", limits) == 6              # RI-6 floor clamps B up
-    assert resolve_ri("A", limits) == 6
-    assert resolve_ri("A+", limits) == 8
+    # The live floor is risk_index.default (the operator's hand-edited "start at
+    # RI <floor>" decision in risk/limits.yaml), and resolve_ri clamps the base
+    # tier UP to that floor. Passing an explicit floor=5 observes the raw base
+    # mapping regardless of the operator's current floor setting.
+    base = limits.conviction_tiers
+    assert base["B"] == 5                            # base tier value unchanged
+    assert resolve_ri("B", limits, floor=5) == 5      # raw base mapping (floor permitting)
+    assert resolve_ri("B", limits) == min(max(base["B"], limits.default_ri), limits.band_high)
+    assert resolve_ri("A", limits) == min(max(base["A"], limits.default_ri), limits.band_high)
+    assert resolve_ri("A+", limits) == min(max(base["A+"], limits.default_ri), limits.band_high)
 
 
 def test_floor_clamps_up():

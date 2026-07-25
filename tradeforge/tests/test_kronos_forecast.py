@@ -242,19 +242,37 @@ def test_premarket_kronos_batch_guards_by_asof():
 
 def test_engine_without_kronos_keeps_both():
     # Same setup but the overlay is OFF (no provider) -> BBB is NOT vetoed.
+    #
+    # Grade is "B" (not "A+") deliberately: this test only cares that nothing
+    # gets vetoed by Kronos, not about the book's heat/concurrency admission
+    # walk (that has its own dedicated tests). "B" keeps each candidate's
+    # resolved-RI dollar risk small enough to fit two names under the book's
+    # current heat cap for any operator-set risk_index.default within the
+    # normal [5, 8] band (an A+ candidate's fixed 2%-of-equity risk does not).
     from backtest.daily.bracket_engine import BracketConfig
     from portfolio.config import load_portfolio_config
     from portfolio.engine import PortfolioEngine
     from portfolio.model import SleeveSpec
+    from risk.config import load_limits
+    from risk.sizing import per_trade_dollar_risk, resolve_ri
 
     pcfg = load_portfolio_config()
     import dataclasses
     pcfg = dataclasses.replace(pcfg, synthetic_stop=dataclasses.replace(pcfg.synthetic_stop, window=2))
 
+    limits = load_limits()
+    row = limits.level(limits.default_ri)
+    cand_risk = per_trade_dollar_risk(100_000.0, resolve_ri("B", limits), limits)
+    assert 2 * cand_risk <= row.portfolio_heat_pct / 100.0 * 100_000.0 + 1e-9, (
+        "test setup: two grade-B candidates no longer fit under this config's "
+        "book heat cap -- the fixture needs a smaller grade/equity combination"
+    )
+    assert row.max_concurrent >= 2, "test setup: this config's max_concurrent < 2"
+
     class TwoNames:
         def entry_score(self, symbol, asof, history):
             return {"AAA": 1.0, "BBB": 1.0}.get(symbol)
-    sleeves = [SleeveSpec(name="brk", strategy=TwoNames(), kind="score", grade="A+",
+    sleeves = [SleeveSpec(name="brk", strategy=TwoNames(), kind="score", grade="B",
                           family="trend", bracket=BracketConfig(atr_window=2))]
     eng = PortfolioEngine(sleeves, pcfg=pcfg)   # no forecast_provider
     book, _ = _step_engine(eng, ["AAA", "BBB"], 4)
