@@ -19,8 +19,17 @@ import json
 import re
 import sys
 
+# Any write/modify verb attached to "order(s)", in either verb_noun or
+# noun_verb form. Read verbs (get/list/fetch/...) are deliberately absent.
+# "replace" is Alpaca's order-amendment verb; "modify/update/amend/edit"
+# cover CLAUDE.md rule 1's "never place, MODIFY, or cancel".
+_ORDER_WRITE_VERBS = (
+    "place|replace|cancel|review|modify|update|amend|edit|change"
+    "|submit|stage|create|send|execute|open|close|adjust"
+)
 ORDER_TOOL_RE = re.compile(
-    r"(^|_)(place|cancel|review)_\w*orders?\b"
+    rf"(^|_)({_ORDER_WRITE_VERBS})_\w*orders?\b"
+    rf"|(^|_)orders?_({_ORDER_WRITE_VERBS})\b"
     r"|exercise_options?"
     r"|options?_exercise"
     r"|order_gateway_live"

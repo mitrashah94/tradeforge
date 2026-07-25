@@ -4,7 +4,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": ".*((^|_)(place|cancel|review)_\\w*orders?\\b|exercise_options?|options?_exercise|order_gateway_live).*",
+        "matcher": ".*((^|_)(place|replace|cancel|review|modify|update|amend|edit|change|submit|stage|create|send|execute|open|close|adjust)_\\w*orders?\\b|(^|_)orders?_(place|replace|cancel|review|modify|update|amend|edit|change|submit|stage|create|send|execute|open|close|adjust)\\b|exercise_options?|options?_exercise|order_gateway_live).*",
         "hooks": [
           {
             "type": "command",
