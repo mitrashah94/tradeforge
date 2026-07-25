@@ -55,6 +55,59 @@ flowchart LR
 | **Journaling / learning** | Trading_Journal.xlsx (manual, R-based), `backtests/sessions.jsonl` with the derived 2×2 verdict, weekly learning report — measures **trader rule adherence** | journalist + performance-analyst agents (auto journals, equity curve, alpha-vs-SPY, edge-decay detection), prop-firm evaluation engine — measures **the system's edge** |
 | **Orchestration** | Claude as decision-support orchestrator + sonnet-coder; TradingView alerts interrupt only on QUALIFIED | 4-agent roster (regime-reader, strategy-researcher, journalist, performance-analyst) + premarket/intraday/EOD/weekly workflows + launchd cron templates (not loaded) |
 
+## Orchestrator & agents perspective
+
+The deepest difference between the two systems is *who is in the loop and when*.
+DayTrading is **human-in-the-loop at the decision point**: agents prepare and
+verify, one alert channel interrupts, the trader decides. tradeforge is
+**human-on-the-loop at the policy level**: LLM agents set the board daily,
+deterministic code executes and protects, the human only moves the risk dial
+and promotion gates.
+
+```mermaid
+flowchart TB
+    subgraph DTO["DayTrading orchestration — human-IN-the-loop"]
+        direction TB
+        DA["Claude Code main session<br/>(orchestrator: validation, math,<br/>journaling, learning loop)"]
+        DB["Fable advisor<br/>(consulted on design +<br/>consequential changes)"]
+        DC["sonnet-coder subagent<br/>(bounded implementation briefs)"]
+        DD["Codex stop-gate<br/>(adversarial review of<br/>every session's changes)"]
+        DE["TradingView alert<br/>QUALIFIED (any) ONLY —<br/>WATCH never reaches the trader"]
+        DF(["TRADER<br/>decides + clicks submit"])
+        DA <--> DB
+        DA --> DC
+        DD -.reviews.-> DA
+        DE --> DF
+        DA -- "decision card,<br/>feasibility math" --> DF
+    end
+
+    subgraph TFO["tradeforge orchestration — human-ON-the-loop (dormant)"]
+        direction TB
+        TA["orchestrator/main.py + event bus<br/>(event-sourced, on-boot recovery)"]
+        TB2["Fast loop — deterministic Python<br/>NO LLM, NO MCP in the hot path<br/>(engine, lifecycle, sizing)"]
+        TC["Policy agents (LLM):<br/>regime-reader · strategy-researcher<br/>journalist · performance-analyst<br/>+ firewall"]
+        TD["Workflows:<br/>premarket · intraday_boot<br/>eod · weekly"]
+        TE["Protections (always-on):<br/>watchdog · dead-man's switch<br/>reconcile · program-abort<br/>PreToolUse order hook"]
+        TF2(["HUMAN<br/>sets risk dial + promotion gates<br/>(risk/limits.yaml, by hand only)"])
+        TC -- "arm strategies,<br/>exposure scalar" --> TA
+        TA --> TB2
+        TD --> TA
+        TE -.guard.-> TB2
+        TF2 -. policy only .-> TA
+    end
+```
+
+| Orchestration aspect | DayTrading (root) | tradeforge/ |
+|---|---|---|
+| **Orchestrator** | Claude Code main session — interactive, per-session | `orchestrator/main.py` + event bus — long-running runtime, event-sourced with on-boot orphan-order recovery |
+| **Where the LLM sits** | In the loop for validation/math/journaling; **never** on the submit click | Policy layer only: agents arm strategies and set exposure; **no LLM or MCP call in the hot path** |
+| **Agent roster** | `sonnet-coder` (implementation), Fable advisor (design consults), Codex stop-gate (adversarial review) | `regime-reader` (daily regime tag → arms strategies), `strategy-researcher` (offline mining, writes nothing live), `journalist` (per-trade journals + digests), `performance-analyst` (equity curve, decay, ratchet, risk-of-ruin), `firewall` |
+| **Interrupt model** | One channel: TradingView "QUALIFIED (any)" alert. WATCH is deliberately kept off the trader's screen (2026-07-13 lesson) | Event bus: bar events, order lifecycle events, agent verdicts; workflows fire on schedule (premarket/intraday-boot/EOD/weekly) |
+| **Scheduling** | Manual daily workflow (07:45 premarket → 08:45–10:30 window → 14:55 flat → post-close record) | launchd cron templates (`scripts/cron/`): nightly data refresh + watchdog — **not installed** |
+| **Safety enforcement** | Root PreToolUse hook denies ALL order tools, fail-closed; receiver is brokerage-free by construction; rules 1–5 in CLAUDE.md | Gated PreToolUse hook (delegates to `orchestrator/hooks.py` evaluator), watchdog, dead-man's switch, broker-vs-ledger reconcile halt, program-abort thresholds |
+| **Human's job** | Make the trade decision; execute manually; get graded by the learning loop | Set the risk dial and promotion gates by hand; review at milestones; never tune live knobs from live P&L |
+| **Agent config lives in** | `.claude/settings.json`, `.claude/agents/sonnet-coder.md` (root) | `tradeforge/.claude/agents/*.md` (4 agents) + `.codex/` mirror (TOML), `orchestrator/agents/*.py` runtime implementations |
+
 ## What is integrated today
 
 ```mermaid
