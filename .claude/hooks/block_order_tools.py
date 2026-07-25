@@ -27,9 +27,12 @@ _ORDER_WRITE_VERBS = (
     "place|replace|cancel|review|modify|update|amend|edit|change"
     "|submit|stage|create|send|execute|open|close|adjust"
 )
+# (_|\b) instead of \b alone: underscore is a word char, so \b never fires
+# before it — plain \b would miss suffixed names like cancel_order_by_id,
+# place_order_v2, or order_cancel_all. "orderbook" still doesn't match.
 ORDER_TOOL_RE = re.compile(
-    rf"(^|_)({_ORDER_WRITE_VERBS})_\w*orders?\b"
-    rf"|(^|_)orders?_({_ORDER_WRITE_VERBS})\b"
+    rf"(^|_)({_ORDER_WRITE_VERBS})_\w*orders?(_|\b)"
+    rf"|(^|_)orders?_({_ORDER_WRITE_VERBS})(_|\b)"
     r"|exercise_options?"
     r"|options?_exercise"
     r"|order_gateway_live"
