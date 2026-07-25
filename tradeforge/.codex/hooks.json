@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 '/Users/mitrashah/Desktop/tradeforge/.codex/hooks/block_live_orders.py'"
+            "command": "python3 '/Users/mitrashah/DayTrading/tradeforge/.codex/hooks/block_live_orders.py'"
           }
         ]
       }

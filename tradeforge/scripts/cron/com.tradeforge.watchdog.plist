@@ -32,11 +32,11 @@
     <array>
         <string>/bin/bash</string>
         <string>-lc</string>
-        <string>cd /Users/mitrashah/Desktop/tradeforge &amp;&amp; exec env PYTHONPATH=. .venv/bin/python -m orchestrator.watchdog --heartbeat-timeout 15 --dms-timeout 30 --poll-interval 1</string>
+        <string>cd /Users/mitrashah/DayTrading/tradeforge &amp;&amp; exec env PYTHONPATH=. .venv/bin/python -m orchestrator.watchdog --heartbeat-timeout 15 --dms-timeout 30 --poll-interval 1</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/mitrashah/Desktop/tradeforge</string>
+    <string>/Users/mitrashah/DayTrading/tradeforge</string>
 
     <!-- Always-on: start at load and restart if it ever exits. -->
     <key>RunAtLoad</key>
@@ -45,9 +45,9 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/mitrashah/Desktop/tradeforge/journal/watchdog.out.log</string>
+    <string>/Users/mitrashah/DayTrading/tradeforge/journal/watchdog.out.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/mitrashah/Desktop/tradeforge/journal/watchdog.err.log</string>
+    <string>/Users/mitrashah/DayTrading/tradeforge/journal/watchdog.err.log</string>
 </dict>
 </plist>

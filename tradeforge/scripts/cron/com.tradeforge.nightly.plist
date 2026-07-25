@@ -22,11 +22,11 @@
     <array>
         <string>/bin/bash</string>
         <string>-lc</string>
-        <string>cd /Users/mitrashah/Desktop/tradeforge &amp;&amp; exec scripts/refresh_data.sh</string>
+        <string>cd /Users/mitrashah/DayTrading/tradeforge &amp;&amp; exec scripts/refresh_data.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/mitrashah/Desktop/tradeforge</string>
+    <string>/Users/mitrashah/DayTrading/tradeforge</string>
 
     <key>StartCalendarInterval</key>
     <dict>
@@ -40,9 +40,9 @@
     <false/>
 
     <key>StandardOutPath</key>
-    <string>/Users/mitrashah/Desktop/tradeforge/journal/nightly.out.log</string>
+    <string>/Users/mitrashah/DayTrading/tradeforge/journal/nightly.out.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/mitrashah/Desktop/tradeforge/journal/nightly.err.log</string>
+    <string>/Users/mitrashah/DayTrading/tradeforge/journal/nightly.err.log</string>
 </dict>
 </plist>
