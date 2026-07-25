@@ -8,7 +8,7 @@ meta:
   per_trade_rule: "per_trade_$ = (per_trade_pct/100) * current_equity, recomputed each trade"
 
 risk_index:
-  default: 6            # current FLOOR; ramps toward 8 by manual, gated decision (never auto-tuned from live P&L)
+  default: 4            # current FLOOR; ramps toward 8 by manual, gated decision (never auto-tuned from live P&L)
   band: [5, 8]          # operating band; 1-4 and 9-10 are reference rows only
   table:
     1:  {per_trade_pct: 0.25, max_concurrent: 1, daily_halt_pct: 1.00, weekly_halt_pct: 3.0,  portfolio_heat_pct: 1.0, leverage_max: 1.0,  options: none,               reference_only: true}
