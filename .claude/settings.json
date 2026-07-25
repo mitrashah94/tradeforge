@@ -4,11 +4,11 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": ".*(place_(equity|option|crypto)s?_order|cancel_(equity|option)s?_order|cancel_option_exercise|exercise_option|review_(equity|option)s?_order|order_gateway_live).*",
+        "matcher": ".*((^|_)(place|cancel|review)_\\w*orders?\\b|exercise_options?|options?_exercise|order_gateway_live).*",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/block_order_tools.py\""
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/block_order_tools.py\" || printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"BLOCKED (fail-closed): order tools are never allowed and the block hook itself failed to run. Fix .claude/hooks/block_order_tools.py before any brokerage tool call.\"}}'"
           }
         ]
       }

@@ -4,18 +4,25 @@
 CLAUDE.md hard rule 1: Claude never places, modifies, cancels, or stages any
 order. Unlike tradeforge's gated hook (tradeforge/.claude/hooks/), there is no
 evaluator to delegate to — every order write tool is denied, always.
-Stdlib-only. Fails closed: any error still emits a deny decision.
+
+Patterns are generic verbs, not an enumerated tool list, so new brokerage
+tools (e.g. a future cancel_crypto_order) are covered without editing this
+file. Keep ORDER_TOOL_RE in sync with the matcher in .claude/settings.json.
+
+Fail-closed contract: this script always emits a deny decision. The settings
+command additionally appends a shell fallback that emits a deny if this
+script itself fails to execute — exit 1/127 would otherwise be treated by
+the hook runner as a non-blocking error and let the tool call proceed.
+Stdlib-only.
 """
 import json
 import re
 import sys
 
 ORDER_TOOL_RE = re.compile(
-    r"place_(equity|option|crypto)s?_order"
-    r"|cancel_(equity|option)s?_order"
-    r"|cancel_option_exercise"
-    r"|exercise_option"
-    r"|review_(equity|option)s?_order"
+    r"(^|_)(place|cancel|review)_\w*orders?\b"
+    r"|exercise_options?"
+    r"|options?_exercise"
     r"|order_gateway_live"
 )
 
