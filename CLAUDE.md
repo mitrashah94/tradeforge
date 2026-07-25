@@ -35,6 +35,7 @@ Keep `daytrading_memory.md` updated as things change (it replaces the old auto-m
 | `signals/fixtures/` | Sample payloads for offline testing |
 | `signals/test_receiver.py` | Self-contained tests (plain asserts) |
 | `tradeforge/` | Dormant autonomous-platform repo (own CLAUDE.md, own venv), kept for later integration. NOT an active strategy source — hard rule 3 applies; nothing in it overrides strategy.md. |
+| `FEATURE_MAP.md` | Functional comparison of DayTrading vs tradeforge by pipeline stage: what lives where, what's integrated, what needs updating |
 
 ## Signal pipeline
 
