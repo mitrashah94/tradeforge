@@ -1,0 +1,14 @@
+{
+  "event": "REJECT",
+  "event_id": "XLE-20260713-CALL-PDH-REJECT-9420",
+  "ticker": "XLE",
+  "timeframe": "5",
+  "setup_type": "A_break_retest",
+  "direction": "CALL",
+  "level": "PDH",
+  "level_price": 55.42,
+  "signal_time_ct": "2026-07-13 09:35",
+  "vwap": 55.18,
+  "rvol": 1.28,
+  "reason": "risk_above_max_atr"
+}

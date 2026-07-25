@@ -1,0 +1,14 @@
+{
+  "event": "INVALIDATED",
+  "event_id": "QQQ-20260713-PUT-ORL-INVALIDATED-9503",
+  "ticker": "QQQ",
+  "timeframe": "5",
+  "setup_type": "B_breakdown_bounce",
+  "direction": "PUT",
+  "level": "ORL",
+  "level_price": 555.80,
+  "signal_time_ct": "2026-07-13 09:35",
+  "vwap": 555.70,
+  "rvol": 1.28,
+  "reason": "closed_through_stop_after_qualified"
+}

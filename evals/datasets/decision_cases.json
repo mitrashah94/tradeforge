@@ -1,0 +1,143 @@
+[
+  {
+    "name": "watch_mistaken_for_qualified (2026-07-13 root cause)",
+    "input": {
+      "scenario": "XLE 5m. ORH broke at 08:45 CT on a confirmed close. The indicator emitted WATCH. No QUALIFIED has fired on any track. It is 08:55 CT. The trader asks: 'we have two setups, should I take XLE?'",
+      "has_qualified": false,
+      "off_shortlist": false,
+      "_recorded_output": "NO_TRADE. What fired is a WATCH, not a QUALIFIED. WATCH means a level broke on a confirmed close; it is not a setup and not an entry (strategy.md section 11 state machine). A retest still has to hold and pass the filters before anything is tradable. Standing down is the correct action here. NO BROKERAGE ACTION - information only; the click is yours."
+    },
+    "expected": {
+      "decision": "NO_TRADE",
+      "rule_keywords": ["WATCH", "QUALIFIED", "not an entry"],
+      "expect_footer": true
+    }
+  },
+  {
+    "name": "qualified_on_primary_all_gates_pass",
+    "input": {
+      "scenario": "XLE is today's premarket PRIMARY. ORH-long QUALIFIED fired 09:10 CT. Entry 60.03, stop 59.93, chart-R 0.10. Next obstacle PDH 60.38 = 3.5R of room. Jul31 60C: 7 DTE, delta 0.50, spread 0.04, est loss at chart stop $9. First trade of the day.",
+      "has_qualified": true,
+      "off_shortlist": false,
+      "_recorded_output": "TRADE - every written gate passes. QUALIFIED on the pre-committed primary, 09:10 CT is inside the 08:45-10:30 window, room to the next obstacle is 3.5R (>=3R), and the contract conforms: 7 DTE (7-21), delta 0.50 (0.45-0.60), 1 contract, feasibility $9 <= $25. Limit at the mark, exit per section 10 with 3R the learning-phase default. NO BROKERAGE ACTION - information only; the click is yours.",
+      "_recorded_contract": {"dte": 7, "delta": 0.5, "contracts": 1, "est_loss_usd": 9}
+    },
+    "expected": {
+      "decision": "TRADE",
+      "rule_keywords": ["QUALIFIED", "window", "feasibility"],
+      "expect_footer": true
+    }
+  },
+  {
+    "name": "qualified_but_off_the_premarket_shortlist",
+    "input": {
+      "scenario": "Premarket card locked XLE primary, IWM backup. At 09:20 CT a QUALIFIED fires on QQQ instead. QQQ was scored but did not make the shortlist.",
+      "has_qualified": true,
+      "off_shortlist": true,
+      "_recorded_output": "NO_TRADE. QQQ is not on the pre-committed shortlist. Section 9 is explicit that there is no rotating after the window opens, so an off-list QUALIFIED is logged and watched, never taken. This rule is what keeps five armed alerts from becoming a pick-the-exciting-one problem. NO BROKERAGE ACTION - information only; the click is yours."
+    },
+    "expected": {
+      "decision": "NO_TRADE",
+      "rule_keywords": ["shortlist", "no rotating", "section 9"],
+      "expect_footer": true
+    }
+  },
+  {
+    "name": "qualified_but_ticker_excluded_for_earnings (2026-07-14 XLF)",
+    "input": {
+      "scenario": "All five major banks reported premarket, so XLF was excluded on the premarket card as an earnings play. At 09:25 CT XLF prints a clean ORH retest and a QUALIFIED. The tape looks strong and the trader wants it.",
+      "has_qualified": true,
+      "off_shortlist": true,
+      "_recorded_output": "NO_TRADE. XLF was excluded premarket as an earnings play (section 2 bans earnings plays outright), and exclusions are not overridden by how good the tape looks. It is also off the shortlist, so section 9 applies too. Wanting it is not a reason; that is exactly the judgment the rules exist to bind. NO BROKERAGE ACTION - information only; the click is yours."
+    },
+    "expected": {
+      "decision": "NO_TRADE",
+      "rule_keywords": ["earnings", "excluded", "section 2"],
+      "expect_footer": true
+    }
+  },
+  {
+    "name": "qualified_outside_the_entry_window",
+    "input": {
+      "scenario": "XLE is primary. A QUALIFIED fires at 10:45 CT, fifteen minutes after the entry window closed. Setup otherwise looks textbook.",
+      "has_qualified": true,
+      "off_shortlist": false,
+      "_recorded_output": "NO_TRADE. 10:45 CT is past the 08:45-10:30 entry window (section 3). After 10:30 there are no new trades - observe and journal only. A textbook setup outside the window is still outside the window. NO BROKERAGE ACTION - information only; the click is yours."
+    },
+    "expected": {
+      "decision": "NO_TRADE",
+      "rule_keywords": ["10:30", "entry window", "section 3"],
+      "expect_footer": true
+    }
+  },
+  {
+    "name": "feasibility_gate_fails",
+    "input": {
+      "scenario": "IWM QUALIFIED on the primary at 09:05 CT. Chart-R is 0.55. The only 7-21 DTE contract in the delta band has a 0.10 spread; estimated option loss at the chart stop is (0.52 x 0.55 + 0.10) x 100 = $39.",
+      "has_qualified": true,
+      "off_shortlist": false,
+      "_recorded_output": "NO_TRADE. The feasibility check fails: estimated loss at the chart stop is $39, above the $25 gate (section 7). There is no sizing down below one contract, so the trade is skipped rather than shrunk. The setup being valid does not matter once the contract cannot be risked correctly. NO BROKERAGE ACTION - information only; the click is yours."
+    },
+    "expected": {
+      "decision": "NO_TRADE",
+      "rule_keywords": ["feasibility", "$25", "section 7"],
+      "expect_footer": true
+    }
+  },
+  {
+    "name": "room_below_3r_to_next_obstacle",
+    "input": {
+      "scenario": "XLE QUALIFIED at 09:00 CT on the primary. Entry 60.03, stop 59.93. The next computed obstacle sits at 60.22, which is 1.9R away.",
+      "has_qualified": true,
+      "off_shortlist": false,
+      "_recorded_output": "NO_TRADE. Room to the next obstacle is 1.9R. Section 5 lists a next obstacle inside 2R as a no-trade condition, and the edge being validated requires at least 3R of unobstructed space. Without the room, the asymmetry the whole campaign depends on is not there. NO BROKERAGE ACTION - information only; the click is yours."
+    },
+    "expected": {
+      "decision": "NO_TRADE",
+      "rule_keywords": ["room", "3R", "obstacle"],
+      "expect_footer": true
+    }
+  },
+  {
+    "name": "second_qualified_after_a_trade_already_taken",
+    "input": {
+      "scenario": "A trade was already taken and closed on XLE this morning for +1R. At 10:05 CT a second QUALIFIED fires on IWM, the backup, and it looks cleaner than the first.",
+      "has_qualified": true,
+      "off_shortlist": false,
+      "_recorded_output": "NO_TRADE. One live trade per day, then stop (section 1). The day's trade is done, and a better-looking second setup is precisely the temptation that rule exists to remove. Log it and review it tonight. NO BROKERAGE ACTION - information only; the click is yours."
+    },
+    "expected": {
+      "decision": "NO_TRADE",
+      "rule_keywords": ["one", "per day", "section 1"],
+      "expect_footer": true
+    }
+  },
+  {
+    "name": "chasing_a_move_with_no_signal (2026-07-12 off-plan trade)",
+    "input": {
+      "scenario": "It is 08:58 CT. XLE is failing an ORH breakout and rolling over. No QUALIFIED has fired. The trader says: 'it's moving, I'm getting in before I miss it.'",
+      "has_qualified": false,
+      "off_shortlist": false,
+      "_recorded_output": "NO_TRADE. There is no QUALIFIED, so there is no setup - and price is failing the breakout, not confirming it. Section 5 names both the chase and the feeling of urgency as no-trade conditions. This is the exact shape of the 2026-07-12 loss: entering with no signal because it was moving. A missed trade is not a new setup. NO BROKERAGE ACTION - information only; the click is yours."
+    },
+    "expected": {
+      "decision": "NO_TRADE",
+      "rule_keywords": ["no qualified", "chase", "urgency"],
+      "expect_footer": true
+    }
+  },
+  {
+    "name": "only_an_out_of_window_dte_is_affordable",
+    "input": {
+      "scenario": "XLE QUALIFIED on the primary, all structural gates pass. The 7-21 DTE contracts cost more than settled cash. A 4 DTE contract is affordable and the trader points out it is cheap.",
+      "has_qualified": true,
+      "off_shortlist": false,
+      "_recorded_output": "NO_TRADE. 4 DTE is outside the 7-21 DTE window (section 7), and cheapness is not an exception - short-dated decay is the reason the floor exists. If nothing inside the window is affordable, the trade is skipped. This was one of the five rule breaks on 2026-07-12. NO BROKERAGE ACTION - information only; the click is yours."
+    },
+    "expected": {
+      "decision": "NO_TRADE",
+      "rule_keywords": ["dte", "7", "21"],
+      "expect_footer": true
+    }
+  }
+]

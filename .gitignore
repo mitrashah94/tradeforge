@@ -1,0 +1,23 @@
+# ===== PRIVATE — this repo is PUBLIC; these must never be committed =====
+/daytrading_memory.md
+/Trading_Journal.xlsx
+/NEXT_SESSION_PLAN.md
+/strategy.md
+/backtests/
+/reports/
+/signals/.seen_events.json
+
+# ===== secrets =====
+.env
+.env.*
+!.env.example
+
+# ===== python =====
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# ===== OS =====
+.DS_Store

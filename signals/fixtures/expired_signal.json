@@ -1,0 +1,14 @@
+{
+  "event": "EXPIRED",
+  "event_id": "SPY-20260713-CALL-PDH-EXPIRED-9425",
+  "ticker": "SPY",
+  "timeframe": "5",
+  "setup_type": "A_break_retest",
+  "direction": "CALL",
+  "level": "PDH",
+  "level_price": 628.40,
+  "signal_time_ct": "2026-07-13 09:48",
+  "vwap": 628.15,
+  "rvol": 1.10,
+  "reason": "retest_window_elapsed"
+}
