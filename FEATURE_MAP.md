@@ -136,7 +136,9 @@ flowchart TB
 
 Priority order, to keep tradeforge honest as a dormant asset:
 
-1. **`risk_index 6→4` vs its tests.** The committed dial change contradicts the RI-6-floor assertions — 11 of 583 tests fail (`test_conviction`, portfolio engine/intents). Decide: revert the dial or update the tests. Until then tradeforge has no green baseline.
+1. ~~**`risk_index 6→4` vs its tests.**~~ **RESOLVED (2026-07-25):** tests now derive
+   expectations from `load_limits()` (`resolve_ri` / `per_trade_dollar_risk`), so the
+   suite is valid for any operator-set `risk_index.default`. Full suite green: 583 passed.
 2. **Stale data.** `market.duckdb` is from Jun 29; the nightly-refresh launchd job is a template, not installed. Fine while dormant; any backtest there runs on month-old data.
 3. **Placeholder MCP configs.** `tradeforge/.mcp.json` and `.codex/config.toml` still contain `REPLACE_WITH_..._MCP_COMMAND` for tradingview/robinhood.
 4. **Contract awareness.** A session opened *inside* `tradeforge/` runs under its CLAUDE.md (autonomous-platform rules), not DayTrading's. Structural scoping handles it, but be conscious of where a session is rooted.
