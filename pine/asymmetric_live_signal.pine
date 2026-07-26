@@ -1,0 +1,746 @@
+//@version=6
+// -----------------------------------------------------------------------------
+// Asymmetric Live Signal v2
+//
+// PURPOSE: Decision-support indicator for liquid ETFs (SPY / QQQ / XLF / XLE /
+// IWM) on a 5-minute chart. It watches FOUR independent break-retest tracks:
+//   PDH-long  (CALL) - previous-day-high breakout retest
+//   ORH-long  (CALL) - opening-range-high breakout retest
+//   PDL-short (PUT)  - previous-day-low breakdown retest
+//   ORL-short (PUT)  - opening-range-low breakdown retest
+// and emits structured JSON alerts for HUMAN REVIEW ONLY.
+//
+// THIS SCRIPT NEVER EXECUTES ANYTHING. It is an indicator(): it places no
+// orders, simulates no fills, sizes no positions, holds no capital, and never
+// calls or connects to any brokerage or order endpoint. Alerts are
+// human-review messages only. Options contracts are selected and executed
+// manually in the broker after a human reviews each alert. Core level and
+// filter calculations mirror an existing, separately verified backtest
+// specification (asymmetric_backtest_v2_orb.pine's levelSource toggle).
+//
+// FOUR TRACKS, ONE ENGINE: all four tracks (PDH-long, ORH-long, PDL-short,
+// ORL-short) run the IDENTICAL break -> retest -> confirm engine: same
+// retestMinBars/retestMaxBars window, same VWAP/RVOL/EMA/candle-color
+// filters, same ATR stop buffer, same riskValid check, same TTL. Only the
+// break level and its readiness gate differ. Each track keeps its own
+// broken/breakBar/done state, reset every newDay.
+//
+// ORB GATING: an ORB break (ORH-long or ORL-short) is only valid when
+// `not inOpeningRange` AND the level is non-na -- mirrors the backtest's
+// `levelsReady` gate. This prevents an intra-range touch of the still-forming
+// range extreme from ever counting as a break.
+//
+// SAME-BAR PRIORITY: there is ONE QUALIFIED per day, globally, via the
+// `qualifiedToday` lockout -- the first track to qualify on a confirmed bar
+// silences the other three for the rest of the day. When two tracks could
+// qualify on the SAME confirmed bar, ORB WINS: the ORH-long and ORL-short
+// blocks are evaluated BEFORE the PDH-long and PDL-short blocks in source
+// order below. This ordering is a DELIBERATE RULE, not an accident --
+// ORB is the only thread the backtest liked. Do not reorder these blocks.
+// Consequence, by design: a track that gets silenced by another track's
+// QUALIFIED before it resolves emits no REJECT/EXPIRED of its own -- a
+// dangling WATCH on that track is expected behavior, not a bug.
+//
+// WATCH IS NOT A TRADE SIGNAL. WATCH means a level broke and we are waiting to
+// see whether the retest holds. It is NOT a setup and NOT an entry. Only
+// QUALIFIED is an inspection prompt -- and even QUALIFIED is never an
+// instruction to buy. Create the morning alert on the named alertcondition
+// "QUALIFIED (any)" ONLY; never on "Any alert() function call", which would
+// put WATCH on the trader's screen with the same weight as QUALIFIED.
+//
+// EVENTS EMITTED (each at most once per track per day, single-line JSON):
+//   WATCH       - confirmed close through the track's level (PDH/ORH CALL,
+//                 PDL/ORL PUT)
+//   QUALIFIED   - retest held with filters; full trade plan payload
+//   REJECT      - price failed to hold the level within the retest window
+//   EXPIRED     - retest window elapsed without qualification or rejection
+//   INVALIDATED - after QUALIFIED, a confirmed close through the structural
+//                 stop before the signal's expiration bar. Reports the
+//                 qualifying track's own level name/price (qLevelName /
+//                 qLevelPrice), snapshotted at QUALIFIED time.
+//
+// v2 HARDENING:
+//   - All state transitions and all alert() calls are gated by
+//     barstate.isconfirmed (nothing fires on a forming realtime candle).
+//   - Every event carries a unique event_id for downstream deduplication.
+//   - Payloads are valid JSON: numbers are bare, missing values are null.
+// -----------------------------------------------------------------------------
+indicator("Asymmetric Live Signal v2", overlay = true, max_labels_count = 100, max_lines_count = 100)
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+GRP_SESSIONS = "Sessions (America/New_York)"
+regularSession      = input.session("0930-1600", "Regular session",       group = GRP_SESSIONS)
+premarketSession    = input.session("0400-0929", "Premarket session",     group = GRP_SESSIONS)
+openingRangeSession = input.session("0930-0944", "Opening range session", group = GRP_SESSIONS)
+entryWindowSession  = input.session("0945-1130", "Entry window session",  group = GRP_SESSIONS)
+
+GRP_SETUP = "Setup"
+retestMinBars            = input.int(1, "Retest minimum bars after break", minval = 0, group = GRP_SETUP)
+retestMaxBars            = input.int(6, "Retest maximum bars after break", minval = 1, group = GRP_SETUP)
+requireConfirmationColor = input.bool(true, "Require confirmation candle color", group = GRP_SETUP)
+signalTtlBars            = input.int(3, "Signal TTL (bars after qualification)", minval = 1, group = GRP_SETUP)
+enableOrbTracks          = input.bool(true, "Enable ORH/ORL (opening-range breakout) tracks", group = GRP_SETUP)
+enablePdTracks           = input.bool(true, "Enable PDH/PDL (previous-day) tracks", group = GRP_SETUP)
+
+GRP_FILTERS = "Filters"
+useVwapFilter         = input.bool(true, "Use VWAP filter", group = GRP_FILTERS)
+useVolumeFilter       = input.bool(true, "Use relative volume filter", group = GRP_FILTERS)
+minimumRelativeVolume = input.float(1.2, "Minimum relative volume", minval = 0.0, step = 0.1, group = GRP_FILTERS)
+volumeAverageLength   = input.int(20, "Volume average length", minval = 1, group = GRP_FILTERS)
+useEmaFilter          = input.bool(false, "Use EMA trend filter (EMA9 vs EMA20)", group = GRP_FILTERS)
+
+GRP_RISK = "Risk model (informational only)"
+atrLength        = input.int(14, "ATR length", minval = 1, group = GRP_RISK)
+atrStopBuffer    = input.float(0.10, "ATR stop buffer (x ATR)", minval = 0.0, step = 0.05, group = GRP_RISK)
+maximumStopAtr   = input.float(1.0, "Maximum stop distance (x ATR)", minval = 0.1, step = 0.1, group = GRP_RISK)
+minimumStopTicks = input.int(3, "Minimum stop distance (ticks)", minval = 1, group = GRP_RISK)
+
+GRP_DISPLAY = "Display"
+showDailyLevels        = input.bool(true, "Show previous day levels (PDH/PDL/PDC)", group = GRP_DISPLAY)
+showPremarketLevels    = input.bool(true, "Show premarket levels (PMH/PML)", group = GRP_DISPLAY)
+showOpeningRange       = input.bool(true, "Show opening range (ORH/ORL)", group = GRP_DISPLAY)
+showVwap               = input.bool(true, "Show session VWAP", group = GRP_DISPLAY)
+showEmas               = input.bool(true, "Show EMA9 / EMA20", group = GRP_DISPLAY)
+showSignals            = input.bool(true, "Show signal markers", group = GRP_DISPLAY)
+showRLevels            = input.bool(true, "Show entry / stop / R levels", group = GRP_DISPLAY)
+showRightEdgeLabels    = input.bool(true, "Show right-edge labels", group = GRP_DISPLAY)
+showPriceInLabels      = input.bool(true, "Show prices in right-edge labels", group = GRP_DISPLAY)
+labelOffsetBars        = input.int(5, "Label offset (bars to the right)", minval = 1, maxval = 100, group = GRP_DISPLAY)
+showEntryWindowShading = input.bool(true, "Shade entry window background", group = GRP_DISPLAY)
+
+// -----------------------------------------------------------------------------
+// Previous day levels (confirmed values only, no repaint: [1] with lookahead)
+// -----------------------------------------------------------------------------
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1], lookahead = barmerge.lookahead_on)
+pdc = request.security(syminfo.tickerid, "D", close[1], lookahead = barmerge.lookahead_on)
+
+// -----------------------------------------------------------------------------
+// Sessions and day boundary
+// -----------------------------------------------------------------------------
+TZ = "America/New_York"
+TZ_CT = "America/Chicago"
+inRegularSession = not na(time(timeframe.period, regularSession, TZ))
+inPremarket      = not na(time(timeframe.period, premarketSession, TZ))
+inOpeningRange   = not na(time(timeframe.period, openingRangeSession, TZ))
+inEntryWindow    = not na(time(timeframe.period, entryWindowSession, TZ))
+
+newDay = ta.change(time("D")) != 0
+regularSessionStart = inRegularSession and not inRegularSession[1]
+
+// -----------------------------------------------------------------------------
+// Premarket high / low
+// -----------------------------------------------------------------------------
+var float pmh = na
+var float pml = na
+if newDay
+    pmh := na
+    pml := na
+if inPremarket
+    pmh := na(pmh) ? high : math.max(pmh, high)
+    pml := na(pml) ? low : math.min(pml, low)
+
+// -----------------------------------------------------------------------------
+// Opening range high / low
+// -----------------------------------------------------------------------------
+var float orh = na
+var float orl = na
+if newDay or regularSessionStart
+    orh := na
+    orl := na
+if inOpeningRange
+    orh := na(orh) ? high : math.max(orh, high)
+    orl := na(orl) ? low : math.min(orl, low)
+
+// -----------------------------------------------------------------------------
+// Regular-session VWAP (manual cumulative sums, reset each regular session)
+// -----------------------------------------------------------------------------
+var float cumPriceVolume = 0.0
+var float cumVolume = 0.0
+if regularSessionStart
+    cumPriceVolume := 0.0
+    cumVolume := 0.0
+if inRegularSession
+    cumPriceVolume := cumPriceVolume + hlc3 * volume
+    cumVolume := cumVolume + volume
+vwapValue = cumVolume > 0 ? cumPriceVolume / cumVolume : na
+
+// -----------------------------------------------------------------------------
+// Trend, volatility, and volume context
+// -----------------------------------------------------------------------------
+ema9Value = ta.ema(close, 9)
+ema20Value = ta.ema(close, 20)
+atrValue = ta.atr(atrLength)
+volumeAverage = ta.sma(volume, volumeAverageLength)
+relativeVolume = volumeAverage > 0 ? volume / volumeAverage : na
+
+// -----------------------------------------------------------------------------
+// JSON helpers (single-line structured messages for human review)
+// -----------------------------------------------------------------------------
+// JSON-safe number string with 2 decimal places max. str.tostring(x, "#.##")
+// renders 0.95 as ".95" and -0.5 as "-.5", which are invalid JSON numbers, so
+// a leading zero is restored. na renders as unquoted null.
+f_num(float x) =>
+    string result = "null"
+    if not na(x)
+        string s = str.tostring(x, "#.##")
+        if str.startswith(s, "-.")
+            s := "-0" + str.substring(s, 1)
+        else if str.startswith(s, ".")
+            s := "0" + s
+        result := s
+    result
+
+// JSON-safe price string (format.mintick yields plain decimals for these
+// ETFs, e.g. "55.48", which is a valid JSON number). na renders as null.
+f_price(float x) =>
+    na(x) ? "null" : str.tostring(x, format.mintick)
+
+// Common JSON envelope shared by every event. event_id is unique per event:
+// TICKER-yyyyMMdd(CT)-DIRECTION-LEVEL-EVENT-bar_index. Combined with the
+// once-per-side-per-day done-flags, the same setup can never be re-sent.
+f_jsonCommon(string eventName, string direction, string levelName, float levelPrice) =>
+    string setupType = direction == "CALL" ? "A_break_retest" : "B_breakdown_bounce"
+    string eventId = syminfo.ticker + "-" + str.format_time(time, "yyyyMMdd", TZ_CT) + "-" + direction + "-" + levelName + "-" + eventName + "-" + str.tostring(bar_index)
+    string s = "{\"event\":\"" + eventName + "\""
+    s := s + ",\"event_id\":\"" + eventId + "\""
+    s := s + ",\"ticker\":\"" + syminfo.ticker + "\""
+    s := s + ",\"timeframe\":\"" + timeframe.period + "\""
+    s := s + ",\"setup_type\":\"" + setupType + "\""
+    s := s + ",\"direction\":\"" + direction + "\""
+    s := s + ",\"level\":\"" + levelName + "\""
+    s := s + ",\"level_price\":" + f_price(levelPrice)
+    s := s + ",\"signal_time_ct\":\"" + str.format_time(time, "yyyy-MM-dd HH:mm", TZ_CT) + "\""
+    s := s + ",\"vwap\":" + f_price(vwapValue)
+    s := s + ",\"rvol\":" + f_num(relativeVolume)
+    s
+
+// Fold one candidate level into the running nearest-obstacle value. The
+// candidate is excluded by NAME match against the broken level, never by
+// price equality -- two distinct levels can legitimately share a price.
+f_better(float best, float candidate, string candidateName, string brokenLevel, float entryPrice, bool isCall) =>
+    float result = best
+    if candidateName != brokenLevel and not na(candidate)
+        if isCall and candidate > entryPrice and (na(result) or candidate < result)
+            result := candidate
+        if not isCall and candidate < entryPrice and (na(result) or candidate > result)
+            result := candidate
+    result
+
+// Nearest level strictly beyond entry in the trade direction among all seven
+// computed levels -- PDH, PDL, PDC, PMH, PML, ORH, ORL -- excluding only the
+// broken level itself (by name). This means, e.g., an ORH-long trade may
+// legitimately have PDH as its next obstacle, and a PDH-long trade may
+// legitimately have ORH as its next obstacle.
+f_nextObstacle(float entryPrice, bool isCall, string brokenLevel) =>
+    float best = na
+    best := f_better(best, pdh, "PDH", brokenLevel, entryPrice, isCall)
+    best := f_better(best, pdl, "PDL", brokenLevel, entryPrice, isCall)
+    best := f_better(best, pdc, "PDC", brokenLevel, entryPrice, isCall)
+    best := f_better(best, pmh, "PMH", brokenLevel, entryPrice, isCall)
+    best := f_better(best, pml, "PML", brokenLevel, entryPrice, isCall)
+    best := f_better(best, orh, "ORH", brokenLevel, entryPrice, isCall)
+    best := f_better(best, orl, "ORL", brokenLevel, entryPrice, isCall)
+    best
+
+// Signal quality score, integer 0-5.
+f_score(bool isCall, float roomR, float nextObstacle, int barsSinceBreak) =>
+    int sc = 0
+    if not na(relativeVolume) and relativeVolume >= minimumRelativeVolume
+        sc += 1
+    if na(nextObstacle) or (not na(roomR) and roomR >= 3.0)
+        sc += 1
+    if (isCall and ema9Value > ema20Value) or (not isCall and ema9Value < ema20Value)
+        sc += 1
+    if not na(vwapValue) and ((isCall and close > vwapValue + 0.05 * atrValue) or (not isCall and close < vwapValue - 0.05 * atrValue))
+        sc += 1
+    if barsSinceBreak <= 3
+        sc += 1
+    sc
+
+// QUALIFIED-only payload fields. Entry model: entry = confirmation candle
+// close (entry_low), entry_high = confirmation candle high. brokenLevel is
+// the name of the level THIS track broke, passed through to f_nextObstacle
+// so it (and only it) is excluded from the obstacle search.
+f_jsonQualifiedExtras(bool isCall, string brokenLevel, float stopPrice, float riskAmount, float r1, float r2, float r3, float r4, float r5, int barsSinceBreak) =>
+    float entryPrice = close
+    float entryLow = close
+    float entryHigh = high
+    float nextObstacle = f_nextObstacle(entryPrice, isCall, brokenLevel)
+    float roomR = na(nextObstacle) ? na : (isCall ? nextObstacle - entryPrice : entryPrice - nextObstacle) / riskAmount
+    int scoreValue = f_score(isCall, roomR, nextObstacle, barsSinceBreak)
+    int expirationTimeMs = time + signalTtlBars * 5 * 60 * 1000
+    float expirationPrice = isCall ? entryHigh + 0.5 * riskAmount : entryLow - 0.5 * riskAmount
+    string s = ",\"entry_low\":" + f_price(entryLow)
+    s := s + ",\"entry_high\":" + f_price(entryHigh)
+    s := s + ",\"stop\":" + f_price(stopPrice)
+    s := s + ",\"r1\":" + f_price(r1)
+    s := s + ",\"r2\":" + f_price(r2)
+    s := s + ",\"r3\":" + f_price(r3)
+    s := s + ",\"r4\":" + f_price(r4)
+    s := s + ",\"r5\":" + f_price(r5)
+    s := s + ",\"next_obstacle\":" + f_price(nextObstacle)
+    s := s + ",\"room_r\":" + f_num(roomR)
+    s := s + ",\"score\":" + str.tostring(scoreValue)
+    s := s + ",\"expiration_time_ct\":\"" + str.format_time(expirationTimeMs, "yyyy-MM-dd HH:mm", TZ_CT) + "\""
+    s := s + ",\"expiration_price\":" + f_price(expirationPrice)
+    s
+
+// -----------------------------------------------------------------------------
+// Daily signal state, four independent tracks, reset every new day.
+// -----------------------------------------------------------------------------
+// PDH-long (CALL)
+var bool pdhBroken = false
+var int pdhBreakBar = na
+var bool pdhDone = false
+
+// ORH-long (CALL)
+var bool orhBroken = false
+var int orhBreakBar = na
+var bool orhDone = false
+
+// PDL-short (PUT)
+var bool pdlBroken = false
+var int pdlBreakBar = na
+var bool pdlDone = false
+
+// ORL-short (PUT)
+var bool orlBroken = false
+var int orlBreakBar = na
+var bool orlDone = false
+
+var bool qualifiedToday = false
+
+// Qualified trade plan (informational levels only), persists for rest of day
+// unless invalidated by a confirmed close through the structural stop.
+var float qEntry = na
+var float qStop = na
+var float qR1 = na
+var float qR2 = na
+var float qR3 = na
+var float qR4 = na
+var float qR5 = na
+var int qDirection = 0
+
+// Snapshot of the level that qualified, so a later INVALIDATED reports the
+// correct track instead of re-reading a live series (pdh/orh/etc. keep
+// updating intraday for pdc/pmh/pml but pdh/pdl/orh/orl are fixed for the
+// day; this snapshot is still the source of truth for which track fired).
+var string qLevelName = na
+var float qLevelPrice = na
+
+// Live-signal tracking for the INVALIDATED check.
+var bool qLive = false
+var int qExpireBarIndex = na
+
+if newDay
+    pdhBroken := false
+    pdhBreakBar := na
+    pdhDone := false
+    orhBroken := false
+    orhBreakBar := na
+    orhDone := false
+    pdlBroken := false
+    pdlBreakBar := na
+    pdlDone := false
+    orlBroken := false
+    orlBreakBar := na
+    orlDone := false
+    qualifiedToday := false
+    qEntry := na
+    qStop := na
+    qR1 := na
+    qR2 := na
+    qR3 := na
+    qR4 := na
+    qR5 := na
+    qDirection := 0
+    qLevelName := na
+    qLevelPrice := na
+    qLive := false
+    qExpireBarIndex := na
+
+// Per-bar event flags (for plotshape markers)
+bool evWatchLong = false
+bool evWatchShort = false
+bool evQualLong = false
+bool evQualShort = false
+bool evRejectLong = false
+bool evRejectShort = false
+bool evExpireLong = false
+bool evExpireShort = false
+bool evInvalidLong = false
+bool evInvalidShort = false
+
+// Shared filter results
+bool volumeFilterOk = not useVolumeFilter or (not na(relativeVolume) and relativeVolume >= minimumRelativeVolume)
+bool vwapFilterOkLong = not useVwapFilter or (not na(vwapValue) and close > vwapValue)
+bool vwapFilterOkShort = not useVwapFilter or (not na(vwapValue) and close < vwapValue)
+bool emaFilterOkLong = not useEmaFilter or (ema9Value > ema20Value and close > ema9Value)
+bool emaFilterOkShort = not useEmaFilter or (ema9Value < ema20Value and close < ema9Value)
+bool candleOkLong = not requireConfirmationColor or close > open
+bool candleOkShort = not requireConfirmationColor or close < open
+
+float minimumRiskDistance = syminfo.mintick * minimumStopTicks
+
+// -----------------------------------------------------------------------------
+// Signal evaluation: CONFIRMED BARS ONLY. No state transition and no alert()
+// can occur on a forming realtime candle.
+// -----------------------------------------------------------------------------
+if barstate.isconfirmed
+    // -------------------------------------------------------------------------
+    // INVALIDATED: after QUALIFIED, a confirmed close through the structural
+    // stop while the signal is still live (bar_index <= qExpireBarIndex).
+    // If the expiration bar passes without invalidation, nothing further is
+    // emitted (expiration_time_ct in the QUALIFIED payload marks staleness).
+    // -------------------------------------------------------------------------
+    if qLive
+        if bar_index > qExpireBarIndex
+            qLive := false
+        else
+            bool stopViolated = qDirection == 1 ? close < qStop : close > qStop
+            if stopViolated
+                string invalidTail = ",\"reason\":\"closed_through_stop_after_qualified\"}"
+                if qDirection == 1
+                    evInvalidLong := true
+                    alert(f_jsonCommon("INVALIDATED", "CALL", qLevelName, qLevelPrice) + invalidTail, alert.freq_once_per_bar_close)
+                else
+                    evInvalidShort := true
+                    alert(f_jsonCommon("INVALIDATED", "PUT", qLevelName, qLevelPrice) + invalidTail, alert.freq_once_per_bar_close)
+                // Clear the live-signal state and the plotted plan levels.
+                qLive := false
+                qExpireBarIndex := na
+                qEntry := na
+                qStop := na
+                qR1 := na
+                qR2 := na
+                qR3 := na
+                qR4 := na
+                qR5 := na
+                qDirection := 0
+                qLevelName := na
+                qLevelPrice := na
+
+    // =========================================================================
+    // ORB blocks FIRST (deliberate tie-break: ORB wins same-bar priority --
+    // see header comment). PD blocks follow below. Do not reorder.
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // ORH-long / CALL: opening-range-high break -> retest -> qualify / reject / expire
+    //
+    // BREAK CONDITION INVARIANT: this uses the SAME strict cross as PDH
+    // (close > orh and close[1] <= orh), gated by `not inOpeningRange` and
+    // `not na(orh)` (mirrors the backtest's `levelsReady` gate). This needs
+    // no special "first bar after range" case: orh is the max of highs
+    // INCLUDING the final opening-range bar, so the instant `inOpeningRange`
+    // flips false, close[1] <= high[1] <= orh always holds by construction.
+    // The strict cross is therefore automatically "first confirmed close
+    // above ORH after the range completes" -- do not weaken this invariant
+    // in a future refactor without re-deriving it.
+    // -------------------------------------------------------------------------
+    if not qualifiedToday and enableOrbTracks and not orhDone and not orhBroken and inRegularSession and not inOpeningRange and not na(orh) and close > orh and close[1] <= orh
+        orhBroken := true
+        orhBreakBar := bar_index
+        evWatchLong := true
+        alert(f_jsonCommon("WATCH", "CALL", "ORH", orh) + "}", alert.freq_once_per_bar_close)
+
+    if not qualifiedToday and enableOrbTracks and not orhDone and orhBroken
+        int barsSinceBreakOrh = bar_index - orhBreakBar
+        bool inRetestWindowOrh = barsSinceBreakOrh >= retestMinBars and barsSinceBreakOrh <= retestMaxBars
+        // QUALIFIED: touch-and-reclaim of ORH inside the entry window with filters
+        if inRetestWindowOrh and inEntryWindow and low <= orh and close > orh and vwapFilterOkLong and volumeFilterOk and emaFilterOkLong and candleOkLong
+            float entryPrice = close
+            float stopPrice = math.min(low, orh) - atrValue * atrStopBuffer
+            float riskAmount = entryPrice - stopPrice
+            bool riskValid = riskAmount >= minimumRiskDistance and riskAmount <= atrValue * maximumStopAtr
+            if riskValid
+                qEntry := entryPrice
+                qStop := stopPrice
+                qR1 := entryPrice + 1.0 * riskAmount
+                qR2 := entryPrice + 2.0 * riskAmount
+                qR3 := entryPrice + 3.0 * riskAmount
+                qR4 := entryPrice + 4.0 * riskAmount
+                qR5 := entryPrice + 5.0 * riskAmount
+                qDirection := 1
+                qLive := true
+                qExpireBarIndex := bar_index + signalTtlBars
+                qLevelName := "ORH"
+                qLevelPrice := orh
+                orhDone := true
+                qualifiedToday := true
+                evQualLong := true
+                string qualifiedJsonOrh = f_jsonCommon("QUALIFIED", "CALL", "ORH", orh) + f_jsonQualifiedExtras(true, "ORH", stopPrice, riskAmount, qR1, qR2, qR3, qR4, qR5, barsSinceBreakOrh) + "}"
+                alert(qualifiedJsonOrh, alert.freq_once_per_bar_close)
+        // REJECT: close back below ORH minus buffer within the retest window
+        if not orhDone and barsSinceBreakOrh >= 1 and barsSinceBreakOrh <= retestMaxBars and close < orh - atrValue * atrStopBuffer
+            orhDone := true
+            evRejectLong := true
+            alert(f_jsonCommon("REJECT", "CALL", "ORH", orh) + ",\"reason\":\"failed_hold_below_level\"}", alert.freq_once_per_bar_close)
+        // EXPIRED: retest window elapsed without qualification or rejection
+        if not orhDone and barsSinceBreakOrh > retestMaxBars
+            orhDone := true
+            evExpireLong := true
+            alert(f_jsonCommon("EXPIRED", "CALL", "ORH", orh) + ",\"reason\":\"retest_window_elapsed\"}", alert.freq_once_per_bar_close)
+
+    // -------------------------------------------------------------------------
+    // ORL-short / PUT: opening-range-low break -> retest -> qualify / reject / expire
+    // Mirrors ORH-long: same invariant applies (close < orl and
+    // close[1] >= orl is "first confirmed close below ORL after the range
+    // completes" by construction, since orl is the min of lows including the
+    // final opening-range bar).
+    // -------------------------------------------------------------------------
+    if not qualifiedToday and enableOrbTracks and not orlDone and not orlBroken and inRegularSession and not inOpeningRange and not na(orl) and close < orl and close[1] >= orl
+        orlBroken := true
+        orlBreakBar := bar_index
+        evWatchShort := true
+        alert(f_jsonCommon("WATCH", "PUT", "ORL", orl) + "}", alert.freq_once_per_bar_close)
+
+    if not qualifiedToday and enableOrbTracks and not orlDone and orlBroken
+        int barsSinceBreakOrl = bar_index - orlBreakBar
+        bool inRetestWindowOrl = barsSinceBreakOrl >= retestMinBars and barsSinceBreakOrl <= retestMaxBars
+        // QUALIFIED: touch-and-reject of ORL inside the entry window with filters
+        if inRetestWindowOrl and inEntryWindow and high >= orl and close < orl and vwapFilterOkShort and volumeFilterOk and emaFilterOkShort and candleOkShort
+            float entryPrice = close
+            float stopPrice = math.max(high, orl) + atrValue * atrStopBuffer
+            float riskAmount = stopPrice - entryPrice
+            bool riskValid = riskAmount >= minimumRiskDistance and riskAmount <= atrValue * maximumStopAtr
+            if riskValid
+                qEntry := entryPrice
+                qStop := stopPrice
+                qR1 := entryPrice - 1.0 * riskAmount
+                qR2 := entryPrice - 2.0 * riskAmount
+                qR3 := entryPrice - 3.0 * riskAmount
+                qR4 := entryPrice - 4.0 * riskAmount
+                qR5 := entryPrice - 5.0 * riskAmount
+                qDirection := -1
+                qLive := true
+                qExpireBarIndex := bar_index + signalTtlBars
+                qLevelName := "ORL"
+                qLevelPrice := orl
+                orlDone := true
+                qualifiedToday := true
+                evQualShort := true
+                string qualifiedJsonOrl = f_jsonCommon("QUALIFIED", "PUT", "ORL", orl) + f_jsonQualifiedExtras(false, "ORL", stopPrice, riskAmount, qR1, qR2, qR3, qR4, qR5, barsSinceBreakOrl) + "}"
+                alert(qualifiedJsonOrl, alert.freq_once_per_bar_close)
+        // REJECT: close back above ORL plus buffer within the retest window
+        if not orlDone and barsSinceBreakOrl >= 1 and barsSinceBreakOrl <= retestMaxBars and close > orl + atrValue * atrStopBuffer
+            orlDone := true
+            evRejectShort := true
+            alert(f_jsonCommon("REJECT", "PUT", "ORL", orl) + ",\"reason\":\"failed_hold_above_level\"}", alert.freq_once_per_bar_close)
+        // EXPIRED: retest window elapsed without qualification or rejection
+        if not orlDone and barsSinceBreakOrl > retestMaxBars
+            orlDone := true
+            evExpireShort := true
+            alert(f_jsonCommon("EXPIRED", "PUT", "ORL", orl) + ",\"reason\":\"retest_window_elapsed\"}", alert.freq_once_per_bar_close)
+
+    // -------------------------------------------------------------------------
+    // PDH-long / CALL: previous-day-high break -> retest -> qualify / reject / expire
+    // -------------------------------------------------------------------------
+    if not qualifiedToday and enablePdTracks and not pdhDone and not pdhBroken and inRegularSession and not na(pdh) and close > pdh and close[1] <= pdh
+        pdhBroken := true
+        pdhBreakBar := bar_index
+        evWatchLong := true
+        alert(f_jsonCommon("WATCH", "CALL", "PDH", pdh) + "}", alert.freq_once_per_bar_close)
+
+    if not qualifiedToday and enablePdTracks and not pdhDone and pdhBroken
+        int barsSinceBreakPdh = bar_index - pdhBreakBar
+        bool inRetestWindowPdh = barsSinceBreakPdh >= retestMinBars and barsSinceBreakPdh <= retestMaxBars
+        // QUALIFIED: touch-and-reclaim of PDH inside the entry window with filters
+        if inRetestWindowPdh and inEntryWindow and low <= pdh and close > pdh and vwapFilterOkLong and volumeFilterOk and emaFilterOkLong and candleOkLong
+            float entryPrice = close
+            float stopPrice = math.min(low, pdh) - atrValue * atrStopBuffer
+            float riskAmount = entryPrice - stopPrice
+            bool riskValid = riskAmount >= minimumRiskDistance and riskAmount <= atrValue * maximumStopAtr
+            if riskValid
+                qEntry := entryPrice
+                qStop := stopPrice
+                qR1 := entryPrice + 1.0 * riskAmount
+                qR2 := entryPrice + 2.0 * riskAmount
+                qR3 := entryPrice + 3.0 * riskAmount
+                qR4 := entryPrice + 4.0 * riskAmount
+                qR5 := entryPrice + 5.0 * riskAmount
+                qDirection := 1
+                qLive := true
+                qExpireBarIndex := bar_index + signalTtlBars
+                qLevelName := "PDH"
+                qLevelPrice := pdh
+                pdhDone := true
+                qualifiedToday := true
+                evQualLong := true
+                string qualifiedJsonLong = f_jsonCommon("QUALIFIED", "CALL", "PDH", pdh) + f_jsonQualifiedExtras(true, "PDH", stopPrice, riskAmount, qR1, qR2, qR3, qR4, qR5, barsSinceBreakPdh) + "}"
+                alert(qualifiedJsonLong, alert.freq_once_per_bar_close)
+        // REJECT: close back below PDH minus buffer within the retest window
+        if not pdhDone and barsSinceBreakPdh >= 1 and barsSinceBreakPdh <= retestMaxBars and close < pdh - atrValue * atrStopBuffer
+            pdhDone := true
+            evRejectLong := true
+            alert(f_jsonCommon("REJECT", "CALL", "PDH", pdh) + ",\"reason\":\"failed_hold_below_level\"}", alert.freq_once_per_bar_close)
+        // EXPIRED: retest window elapsed without qualification or rejection
+        if not pdhDone and barsSinceBreakPdh > retestMaxBars
+            pdhDone := true
+            evExpireLong := true
+            alert(f_jsonCommon("EXPIRED", "CALL", "PDH", pdh) + ",\"reason\":\"retest_window_elapsed\"}", alert.freq_once_per_bar_close)
+
+    // -------------------------------------------------------------------------
+    // PDL-short / PUT: previous-day-low break -> retest -> qualify / reject / expire
+    // -------------------------------------------------------------------------
+    if not qualifiedToday and enablePdTracks and not pdlDone and not pdlBroken and inRegularSession and not na(pdl) and close < pdl and close[1] >= pdl
+        pdlBroken := true
+        pdlBreakBar := bar_index
+        evWatchShort := true
+        alert(f_jsonCommon("WATCH", "PUT", "PDL", pdl) + "}", alert.freq_once_per_bar_close)
+
+    if not qualifiedToday and enablePdTracks and not pdlDone and pdlBroken
+        int barsSinceBreakPdl = bar_index - pdlBreakBar
+        bool inRetestWindowPdl = barsSinceBreakPdl >= retestMinBars and barsSinceBreakPdl <= retestMaxBars
+        // QUALIFIED: touch-and-reject of PDL inside the entry window with filters
+        if inRetestWindowPdl and inEntryWindow and high >= pdl and close < pdl and vwapFilterOkShort and volumeFilterOk and emaFilterOkShort and candleOkShort
+            float entryPrice = close
+            float stopPrice = math.max(high, pdl) + atrValue * atrStopBuffer
+            float riskAmount = stopPrice - entryPrice
+            bool riskValid = riskAmount >= minimumRiskDistance and riskAmount <= atrValue * maximumStopAtr
+            if riskValid
+                qEntry := entryPrice
+                qStop := stopPrice
+                qR1 := entryPrice - 1.0 * riskAmount
+                qR2 := entryPrice - 2.0 * riskAmount
+                qR3 := entryPrice - 3.0 * riskAmount
+                qR4 := entryPrice - 4.0 * riskAmount
+                qR5 := entryPrice - 5.0 * riskAmount
+                qDirection := -1
+                qLive := true
+                qExpireBarIndex := bar_index + signalTtlBars
+                qLevelName := "PDL"
+                qLevelPrice := pdl
+                pdlDone := true
+                qualifiedToday := true
+                evQualShort := true
+                string qualifiedJsonShort = f_jsonCommon("QUALIFIED", "PUT", "PDL", pdl) + f_jsonQualifiedExtras(false, "PDL", stopPrice, riskAmount, qR1, qR2, qR3, qR4, qR5, barsSinceBreakPdl) + "}"
+                alert(qualifiedJsonShort, alert.freq_once_per_bar_close)
+        // REJECT: close back above PDL plus buffer within the retest window
+        if not pdlDone and barsSinceBreakPdl >= 1 and barsSinceBreakPdl <= retestMaxBars and close > pdl + atrValue * atrStopBuffer
+            pdlDone := true
+            evRejectShort := true
+            alert(f_jsonCommon("REJECT", "PUT", "PDL", pdl) + ",\"reason\":\"failed_hold_above_level\"}", alert.freq_once_per_bar_close)
+        // EXPIRED: retest window elapsed without qualification or rejection
+        if not pdlDone and barsSinceBreakPdl > retestMaxBars
+            pdlDone := true
+            evExpireShort := true
+            alert(f_jsonCommon("EXPIRED", "PUT", "PDL", pdl) + ",\"reason\":\"retest_window_elapsed\"}", alert.freq_once_per_bar_close)
+
+// -----------------------------------------------------------------------------
+// Level plots
+// -----------------------------------------------------------------------------
+plot(showDailyLevels ? pdh : na, "PDH", color = color.red, linewidth = 2, style = plot.style_linebr)
+plot(showDailyLevels ? pdl : na, "PDL", color = color.green, linewidth = 2, style = plot.style_linebr)
+plot(showDailyLevels ? pdc : na, "PDC", color = color.gray, linewidth = 1, style = plot.style_linebr)
+plot(showPremarketLevels ? pmh : na, "PMH", color = color.orange, linewidth = 2, style = plot.style_linebr)
+plot(showPremarketLevels ? pml : na, "PML", color = color.purple, linewidth = 2, style = plot.style_linebr)
+plot(showOpeningRange ? orh : na, "ORH", color = color.yellow, linewidth = 2, style = plot.style_linebr)
+plot(showOpeningRange ? orl : na, "ORL", color = color.aqua, linewidth = 2, style = plot.style_linebr)
+plot(showVwap ? vwapValue : na, "VWAP", color = color.blue, linewidth = 3, style = plot.style_linebr)
+plot(showEmas ? ema9Value : na, "EMA9", color = color.teal, linewidth = 1, style = plot.style_linebr)
+plot(showEmas ? ema20Value : na, "EMA20", color = color.orange, linewidth = 1, style = plot.style_linebr)
+
+// Qualified plan levels (persist for the rest of the day after QUALIFIED,
+// cleared forward if the signal is INVALIDATED)
+plot(showRLevels ? qEntry : na, "Entry", color = color.white, linewidth = 2, style = plot.style_linebr)
+plot(showRLevels ? qStop : na, "Stop", color = color.rgb(255, 0, 0), linewidth = 3, style = plot.style_linebr)
+plot(showRLevels ? qR1 : na, "1R", color = color.new(color.green, 55), linewidth = 1, style = plot.style_linebr)
+plot(showRLevels ? qR2 : na, "2R", color = color.new(color.green, 40), linewidth = 1, style = plot.style_linebr)
+plot(showRLevels ? qR3 : na, "3R", color = color.new(color.green, 20), linewidth = 2, style = plot.style_linebr)
+plot(showRLevels ? qR4 : na, "4R", color = color.new(color.lime, 10), linewidth = 2, style = plot.style_linebr)
+plot(showRLevels ? qR5 : na, "5R", color = color.new(color.lime, 0), linewidth = 2, style = plot.style_linebr)
+
+// -----------------------------------------------------------------------------
+// Signal markers
+// -----------------------------------------------------------------------------
+plotshape(showSignals and evWatchLong, "Watch CALL", style = shape.labelup, location = location.belowbar, color = color.new(color.gray, 0), text = "WATCH", textcolor = color.white, size = size.tiny)
+plotshape(showSignals and evWatchShort, "Watch PUT", style = shape.labeldown, location = location.abovebar, color = color.new(color.gray, 0), text = "WATCH", textcolor = color.white, size = size.tiny)
+plotshape(showSignals and evQualLong, "Qualified CALL", style = shape.labelup, location = location.belowbar, color = color.new(color.green, 0), text = "CALL\nSETUP", textcolor = color.white, size = size.small)
+plotshape(showSignals and evQualShort, "Qualified PUT", style = shape.labeldown, location = location.abovebar, color = color.new(color.red, 0), text = "PUT\nSETUP", textcolor = color.white, size = size.small)
+plotshape(showSignals and evRejectLong, "Reject CALL", style = shape.xcross, location = location.belowbar, color = color.new(color.orange, 0), size = size.small)
+plotshape(showSignals and evRejectShort, "Reject PUT", style = shape.xcross, location = location.abovebar, color = color.new(color.orange, 0), size = size.small)
+plotshape(showSignals and evExpireLong, "Expired CALL", style = shape.xcross, location = location.belowbar, color = color.new(color.silver, 0), size = size.small)
+plotshape(showSignals and evExpireShort, "Expired PUT", style = shape.xcross, location = location.abovebar, color = color.new(color.silver, 0), size = size.small)
+plotshape(showSignals and evInvalidLong, "Invalidated CALL", style = shape.xcross, location = location.belowbar, color = color.new(color.red, 0), size = size.small)
+plotshape(showSignals and evInvalidShort, "Invalidated PUT", style = shape.xcross, location = location.abovebar, color = color.new(color.red, 0), size = size.small)
+
+// -----------------------------------------------------------------------------
+// NAMED ALERT CONDITIONS (easy to select in the TradingView alert dialog)
+// -----------------------------------------------------------------------------
+// These appear by NAME in the alert "Condition" second dropdown.
+//
+// Create your morning alert on "QUALIFIED (any)" ONLY.
+// Do NOT use "Any alert() function call" -- that pipes WATCH to your screen with
+// the same weight as QUALIFIED. On 2026-07-13 that caused the trader to believe
+// he had two setups when the engine produced ZERO. WATCH is not a trade signal.
+// Add the "INVALIDATED" alert only once you are actually in a position.
+// The rich JSON still flows through the alert() calls above for Claude/the
+// receiver to consume as context.
+//
+// DO NOT REORDER these alertcondition() calls -- reordering orphans every alert
+// the user has already saved in TradingView.
+alertcondition(evQualLong or evQualShort, title = "QUALIFIED (any)", message = "Asymmetric QUALIFIED on {{ticker}} -- check the chart and Claude")
+alertcondition(evQualLong, title = "QUALIFIED CALL", message = "Asymmetric QUALIFIED CALL on {{ticker}} -- inspect now")
+alertcondition(evQualShort, title = "QUALIFIED PUT", message = "Asymmetric QUALIFIED PUT on {{ticker}} -- inspect now")
+alertcondition(evWatchLong or evWatchShort, title = "WATCH (level broke)", message = "Asymmetric WATCH on {{ticker}} -- a level broke, watching for retest")
+alertcondition(evInvalidLong or evInvalidShort, title = "INVALIDATED (stop hit)", message = "Asymmetric INVALIDATED on {{ticker}} -- confirmed close through stop, exit if in")
+
+// -----------------------------------------------------------------------------
+// Entry window shading
+// -----------------------------------------------------------------------------
+bgcolor(showEntryWindowShading and inEntryWindow ? color.new(color.blue, 92) : na, title = "Entry window shading")
+
+// -----------------------------------------------------------------------------
+// Right-edge labels (one per visible level, updated on the last bar)
+// -----------------------------------------------------------------------------
+f_updateLevelLabel(label existingLabel, bool show, float price, string levelName, color bgColor, color txtColor) =>
+    label updated = existingLabel
+    if show and not na(price)
+        string labelText = showPriceInLabels ? levelName + "  " + str.tostring(price, format.mintick) : levelName
+        if na(updated)
+            updated := label.new(bar_index + labelOffsetBars, price, labelText, style = label.style_label_left, color = color.new(bgColor, 15), textcolor = txtColor, size = size.small)
+        else
+            label.set_xy(updated, bar_index + labelOffsetBars, price)
+            label.set_text(updated, labelText)
+    else if not na(updated)
+        label.delete(updated)
+        updated := label(na)
+    updated
+
+var label pdhLabel = na
+var label pdlLabel = na
+var label pdcLabel = na
+var label pmhLabel = na
+var label pmlLabel = na
+var label orhLabel = na
+var label orlLabel = na
+var label vwapLabel = na
+var label entryLabel = na
+var label stopLabel = na
+var label r1Label = na
+var label r2Label = na
+var label r3Label = na
+var label r4Label = na
+var label r5Label = na
+
+if barstate.islast
+    bool labelsOn = showRightEdgeLabels
+    pdhLabel := f_updateLevelLabel(pdhLabel, labelsOn and showDailyLevels, pdh, "PDH", color.red, color.white)
+    pdlLabel := f_updateLevelLabel(pdlLabel, labelsOn and showDailyLevels, pdl, "PDL", color.green, color.white)
+    pdcLabel := f_updateLevelLabel(pdcLabel, labelsOn and showDailyLevels, pdc, "PDC", color.gray, color.white)
+    pmhLabel := f_updateLevelLabel(pmhLabel, labelsOn and showPremarketLevels, pmh, "PMH", color.orange, color.white)
+    pmlLabel := f_updateLevelLabel(pmlLabel, labelsOn and showPremarketLevels, pml, "PML", color.purple, color.white)
+    orhLabel := f_updateLevelLabel(orhLabel, labelsOn and showOpeningRange, orh, "ORH", color.yellow, color.black)
+    orlLabel := f_updateLevelLabel(orlLabel, labelsOn and showOpeningRange, orl, "ORL", color.aqua, color.black)
+    vwapLabel := f_updateLevelLabel(vwapLabel, labelsOn and showVwap, vwapValue, "VWAP", color.blue, color.white)
+    entryLabel := f_updateLevelLabel(entryLabel, labelsOn and showRLevels, qEntry, "ENTRY", color.white, color.black)
+    stopLabel := f_updateLevelLabel(stopLabel, labelsOn and showRLevels, qStop, "STOP", color.rgb(255, 0, 0), color.white)
+    r1Label := f_updateLevelLabel(r1Label, labelsOn and showRLevels, qR1, "1R", color.green, color.white)
+    r2Label := f_updateLevelLabel(r2Label, labelsOn and showRLevels, qR2, "2R", color.green, color.white)
+    r3Label := f_updateLevelLabel(r3Label, labelsOn and showRLevels, qR3, "3R", color.green, color.white)
+    r4Label := f_updateLevelLabel(r4Label, labelsOn and showRLevels, qR4, "4R", color.lime, color.black)
+    r5Label := f_updateLevelLabel(r5Label, labelsOn and showRLevels, qR5, "5R", color.lime, color.black)

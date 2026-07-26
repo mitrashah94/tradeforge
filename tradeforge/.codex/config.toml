@@ -1,0 +1,6 @@
+[mcp_servers.robinhood]
+command = "REPLACE_WITH_ROBINHOOD_MCP_COMMAND"
+env_vars = ["ROBINHOOD_TOKEN"]
+
+[mcp_servers.tradingview]
+command = "REPLACE_WITH_TRADINGVIEW_MCP_COMMAND"

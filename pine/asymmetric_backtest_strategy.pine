@@ -1,0 +1,449 @@
+//@version=6
+// =============================================================================
+//  ASYMMETRIC BACKTEST v2 -- UNDERLYING SECURITY ONLY
+// =============================================================================
+//  IMPORTANT: This strategy backtests the UNDERLYING security (SPY/QQQ/XLF/
+//  XLE/IWM etc.) on 5-minute charts. It does NOT model option contracts.
+//  There is NO delta, gamma, theta, vega, implied-volatility, bid/ask spread,
+//  or strike-selection modeling anywhere in this script.
+//
+//  Results are reported in R MULTIPLES (risk units), not raw dollars.
+//  The R unit is a theoretical dollar risk per trade in the underlying.
+//  Live execution of this system uses option contracts that are selected
+//  MANUALLY in the broker; this backtest only validates the underlying
+//  entry/exit edge and its R-based expectancy.
+//
+//  v2: Break levels are selectable via "Break level source":
+//    - "PDH/PDL"       -- prior-day high/low (original behavior, default)
+//    - "ORH/ORL (ORB)" -- opening-range high/low (0930-0944 range); breaks
+//      are only valid after the opening range completes.
+// =============================================================================
+
+strategy("Asymmetric Backtest v2 (Underlying, R-based)", overlay = true,
+  initial_capital = 1100, currency = currency.USD, pyramiding = 0,
+  margin_long = 100, margin_short = 100,
+  // Friction disabled for signal-quality measurement: with the $1,100 equity
+  // cap, per-trade dollar risk is tiny (often under $5), so a $1/order
+  // commission plus 1-tick slippage distorted results by 1-3R per trade in
+  // the 2026-07-12 sweep. Live friction is options-based (spread), modeled
+  // separately in the contract feasibility check.
+  commission_type = strategy.commission.cash_per_order, commission_value = 0.00,
+  slippage = 0, process_orders_on_close = true, calc_on_every_tick = false,
+  max_labels_count = 100)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+// --- Entry logic ---
+entryMode                = input.string("Retest only", "Entry mode", options = ["Retest only", "Break only", "Break or retest"], group = "Entry")
+levelSource              = input.string("PDH/PDL", "Break level source", options = ["PDH/PDL", "ORH/ORL (ORB)"], group = "Entry")
+retestMinBars            = input.int(1, "Retest: min bars after break", minval = 0, group = "Entry")
+retestMaxBars            = input.int(6, "Retest: max bars after break", minval = 1, group = "Entry")
+requireConfirmationColor = input.bool(true, "Require confirmation candle color", group = "Entry")
+
+// --- Filters ---
+useVwapFilter            = input.bool(true, "Use VWAP filter", group = "Filters")
+useVolumeFilter          = input.bool(true, "Use relative volume filter", group = "Filters")
+minimumRelativeVolume    = input.float(1.2, "Minimum relative volume", minval = 0.1, step = 0.1, group = "Filters")
+volumeAverageLength      = input.int(20, "Volume average length", minval = 1, group = "Filters")
+useEmaFilter             = input.bool(false, "Use EMA trend filter (9/20)", group = "Filters")
+
+// --- Risk / stops ---
+riskPerTradeR            = input.float(25.0, "R unit in underlying dollars", minval = 1.0, step = 1.0, group = "Risk", tooltip = "Theoretical dollar risk per trade used for position sizing. Actual per-trade dollar risk may be lower when equity caps share count.")
+atrLength                = input.int(14, "ATR length", minval = 1, group = "Risk")
+atrStopBuffer            = input.float(0.10, "ATR stop buffer (x ATR)", minval = 0.0, step = 0.05, group = "Risk")
+maximumStopAtr           = input.float(1.0, "Maximum stop distance (x ATR)", minval = 0.1, step = 0.1, group = "Risk")
+minimumStopTicks         = input.int(3, "Minimum stop distance (ticks)", minval = 1, group = "Risk")
+
+// --- Exits ---
+exitMode                 = input.string("Fixed 3R", "Exit mode", options = ["Fixed 2R", "Fixed 3R", "Fixed 5R", "Trail after 2R"], group = "Exits")
+
+// --- Sessions (America/New_York) ---
+regularSession           = input.session("0930-1600", "Regular session", group = "Sessions")
+premarketSession         = input.session("0400-0929", "Premarket session", group = "Sessions")
+openingRangeSession      = input.session("0930-0944", "Opening range window", group = "Sessions")
+entryWindowSession       = input.session("0945-1130", "Entry window", group = "Sessions")
+eodExitSession           = input.session("1555-1600", "End-of-day exit window", group = "Sessions")
+
+// --- Display ---
+showPerformanceTable     = input.bool(true, "Show performance table", group = "Display")
+showTradeLabels          = input.bool(true, "Show realized R labels at trade close", group = "Display")
+
+// =============================================================================
+// SESSIONS / DAY STATE
+// =============================================================================
+inRegular     = not na(time(timeframe.period, regularSession, "America/New_York"))
+inPremarket   = not na(time(timeframe.period, premarketSession, "America/New_York"))
+inOpenRange   = not na(time(timeframe.period, openingRangeSession, "America/New_York"))
+inEntryWindow = not na(time(timeframe.period, entryWindowSession, "America/New_York"))
+inEodWindow   = not na(time(timeframe.period, eodExitSession, "America/New_York"))
+
+newDay = ta.change(time("D")) != 0
+
+// =============================================================================
+// PRIOR-DAY LEVELS (documented [1] pattern: confirmed prior daily bar only)
+// =============================================================================
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1], lookahead = barmerge.lookahead_on)
+pdc = request.security(syminfo.tickerid, "D", close[1], lookahead = barmerge.lookahead_on)
+
+// =============================================================================
+// INTRADAY LEVELS: PMH/PML, ORH/ORL, SESSION VWAP, EMAS, ATR, RVOL
+// =============================================================================
+var float pmh = na
+var float pml = na
+var float orh = na
+var float orl = na
+
+if newDay
+    pmh := na
+    pml := na
+    orh := na
+    orl := na
+
+if inPremarket
+    pmh := na(pmh) ? high : math.max(pmh, high)
+    pml := na(pml) ? low : math.min(pml, low)
+
+if inOpenRange
+    orh := na(orh) ? high : math.max(orh, high)
+    orl := na(orl) ? low : math.min(orl, low)
+
+// Custom regular-session VWAP (cumulative hlc3*volume / volume, reset at
+// regular-session open; intentionally NOT ta.vwap).
+var float cumPV  = na
+var float cumVol = na
+regularOpenBar = inRegular and not inRegular[1]
+if regularOpenBar
+    cumPV  := 0.0
+    cumVol := 0.0
+if inRegular
+    cumPV  := nz(cumPV) + hlc3 * volume
+    cumVol := nz(cumVol) + volume
+sessionVwap = inRegular and not na(cumVol) and cumVol > 0 ? cumPV / cumVol : na
+
+ema9  = ta.ema(close, 9)
+ema20 = ta.ema(close, 20)
+atr   = ta.atr(atrLength)
+
+volSma         = ta.sma(volume, volumeAverageLength)
+relativeVolume = not na(volSma) and volSma > 0 ? volume / volSma : 0.0
+
+// =============================================================================
+// DAILY TRADE STATE
+// =============================================================================
+var bool tradedToday    = false
+var bool longBroken     = false
+var bool shortBroken    = false
+var int  longBreakBar   = na
+var int  shortBreakBar  = na
+
+// Planned trade state (stored at entry, persists through the day for plotting)
+var float plannedEntry      = na
+var float plannedStop       = na
+var float entryRiskPerShare = na
+var int   entryQty          = na
+var float lvlR1             = na
+var float lvlR2             = na
+var float lvlR3             = na
+var float lvlR4             = na
+var float lvlR5             = na
+var bool  trailArmed        = false
+var float trailStop         = na
+
+if newDay
+    tradedToday    := false
+    longBroken     := false
+    shortBroken    := false
+    longBreakBar   := na
+    shortBreakBar  := na
+    plannedEntry      := na
+    plannedStop       := na
+    entryRiskPerShare := na
+    entryQty          := na
+    lvlR1 := na
+    lvlR2 := na
+    lvlR3 := na
+    lvlR4 := na
+    lvlR5 := na
+    trailArmed := false
+    trailStop  := na
+
+// =============================================================================
+// BREAK LEVEL SELECTION
+// =============================================================================
+// usePdLevels: original PDH/PDL behavior (level constant all day).
+// ORB mode:    level is the opening-range high/low; it only exists once the
+//              opening range has printed, and breaks are only valid AFTER the
+//              range completes (not inOpenRange), so an intra-range cross of
+//              the still-forming level never counts as a break.
+// The level is read ONCE per bar into a single variable so both sides of the
+// crossing test (close vs level, close[1] vs level) use the same value.
+usePdLevels = levelSource == "PDH/PDL"
+float longBreakLevel  = usePdLevels ? pdh : orh
+float shortBreakLevel = usePdLevels ? pdl : orl
+bool  levelsReady     = usePdLevels ? true : not inOpenRange
+
+// =============================================================================
+// BREAK DETECTION (once per day per side, regular session only)
+// =============================================================================
+if inRegular and levelsReady and not longBroken and not na(longBreakLevel) and close > longBreakLevel and close[1] <= longBreakLevel
+    longBroken   := true
+    longBreakBar := bar_index
+
+if inRegular and levelsReady and not shortBroken and not na(shortBreakLevel) and close < shortBreakLevel and close[1] >= shortBreakLevel
+    shortBroken   := true
+    shortBreakBar := bar_index
+
+// =============================================================================
+// FILTERS
+// =============================================================================
+allowBreak  = entryMode == "Break only" or entryMode == "Break or retest"
+allowRetest = entryMode == "Retest only" or entryMode == "Break or retest"
+
+vwapOkLong   = not useVwapFilter or (not na(sessionVwap) and close > sessionVwap)
+vwapOkShort  = not useVwapFilter or (not na(sessionVwap) and close < sessionVwap)
+volumeOk     = not useVolumeFilter or relativeVolume >= minimumRelativeVolume
+emaOkLong    = not useEmaFilter or (ema9 > ema20 and close > ema9)
+emaOkShort   = not useEmaFilter or (ema9 < ema20 and close < ema9)
+confirmLong  = not requireConfirmationColor or close > open
+confirmShort = not requireConfirmationColor or close < open
+
+longFiltersOk  = vwapOkLong and volumeOk and emaOkLong and confirmLong
+shortFiltersOk = vwapOkShort and volumeOk and emaOkShort and confirmShort
+
+isFlat = strategy.position_size == 0
+
+// =============================================================================
+// ENTRY SIGNALS
+// =============================================================================
+// Long (upper level side: PDH or ORH)
+longBreakSignal  = allowBreak and longBroken and not na(longBreakBar) and bar_index == longBreakBar
+longRetestSignal = allowRetest and longBroken and not na(longBreakBar) and
+  bar_index - longBreakBar >= retestMinBars and bar_index - longBreakBar <= retestMaxBars and
+  not na(longBreakLevel) and low <= longBreakLevel and close > longBreakLevel
+longSetup = (longBreakSignal or longRetestSignal) and inEntryWindow and longFiltersOk and isFlat and not tradedToday
+
+// Short (lower level side: PDL or ORL, mirrored)
+shortBreakSignal  = allowBreak and shortBroken and not na(shortBreakBar) and bar_index == shortBreakBar
+shortRetestSignal = allowRetest and shortBroken and not na(shortBreakBar) and
+  bar_index - shortBreakBar >= retestMinBars and bar_index - shortBreakBar <= retestMaxBars and
+  not na(shortBreakLevel) and high >= shortBreakLevel and close < shortBreakLevel
+shortSetup = (shortBreakSignal or shortRetestSignal) and inEntryWindow and shortFiltersOk and isFlat and not tradedToday
+
+// Exit target multiple for fixed modes
+float fixedTargetR = exitMode == "Fixed 2R" ? 2.0 : exitMode == "Fixed 3R" ? 3.0 : exitMode == "Fixed 5R" ? 5.0 : na
+isTrailMode = exitMode == "Trail after 2R"
+
+// Fired flags for plotshape markers
+bool longEntryFired  = false
+bool shortEntryFired = false
+
+// =============================================================================
+// ORDER PLACEMENT WITH R-BASED + EQUITY-CAPPED SIZING
+// =============================================================================
+// qtyByRisk   = floor(R unit dollars / per-share risk)
+// qtyByEquity = floor(equity / price)  -- fully-funded cap: never buy/short
+//               more shares than equity affords at 100% margin.
+// qty = min(qtyByRisk, qtyByEquity); if qty < 1 the trade is SKIPPED entirely.
+// When equity caps size, per-trade dollar risk (qty * risk) is BELOW the R
+// unit -- realistic and intended for a $1,100 account.
+if longSetup
+    float stopLevel = math.min(low, longBreakLevel) - atr * atrStopBuffer
+    float risk = close - stopLevel
+    bool stopValid = risk >= syminfo.mintick * minimumStopTicks and risk <= atr * maximumStopAtr
+    if stopValid
+        int qtyByRisk   = int(math.floor(riskPerTradeR / risk))
+        int qtyByEquity = close > 0 ? int(math.floor(strategy.equity / close)) : 0
+        int qty = math.min(qtyByRisk, qtyByEquity)
+        if qty >= 1
+            plannedEntry      := close
+            plannedStop       := stopLevel
+            entryRiskPerShare := risk
+            entryQty          := qty
+            lvlR1 := plannedEntry + 1.0 * risk
+            lvlR2 := plannedEntry + 2.0 * risk
+            lvlR3 := plannedEntry + 3.0 * risk
+            lvlR4 := plannedEntry + 4.0 * risk
+            lvlR5 := plannedEntry + 5.0 * risk
+            trailArmed := false
+            trailStop  := na
+            tradedToday := true
+            longEntryFired := true
+            strategy.entry("Long", strategy.long, qty = qty)
+            if isTrailMode
+                strategy.exit("Exit L", from_entry = "Long", stop = plannedStop)
+            else
+                strategy.exit("Exit L", from_entry = "Long", stop = plannedStop, limit = plannedEntry + fixedTargetR * risk)
+
+if shortSetup
+    float stopLevel = math.max(high, shortBreakLevel) + atr * atrStopBuffer
+    float risk = stopLevel - close
+    bool stopValid = risk >= syminfo.mintick * minimumStopTicks and risk <= atr * maximumStopAtr
+    if stopValid
+        int qtyByRisk   = int(math.floor(riskPerTradeR / risk))
+        int qtyByEquity = close > 0 ? int(math.floor(strategy.equity / close)) : 0
+        int qty = math.min(qtyByRisk, qtyByEquity)
+        if qty >= 1
+            plannedEntry      := close
+            plannedStop       := stopLevel
+            entryRiskPerShare := risk
+            entryQty          := qty
+            lvlR1 := plannedEntry - 1.0 * risk
+            lvlR2 := plannedEntry - 2.0 * risk
+            lvlR3 := plannedEntry - 3.0 * risk
+            lvlR4 := plannedEntry - 4.0 * risk
+            lvlR5 := plannedEntry - 5.0 * risk
+            trailArmed := false
+            trailStop  := na
+            tradedToday := true
+            shortEntryFired := true
+            strategy.entry("Short", strategy.short, qty = qty)
+            if isTrailMode
+                strategy.exit("Exit S", from_entry = "Short", stop = plannedStop)
+            else
+                strategy.exit("Exit S", from_entry = "Short", stop = plannedStop, limit = plannedEntry - fixedTargetR * risk)
+
+// =============================================================================
+// IN-POSITION EXIT MANAGEMENT
+// =============================================================================
+if strategy.position_size > 0 and not na(plannedStop)
+    if isTrailMode
+        if not trailArmed and not na(lvlR2) and high >= lvlR2
+            trailArmed := true
+            trailStop  := plannedStop
+        if trailArmed
+            trailStop := math.max(nz(trailStop, plannedStop), math.min(low[1], low[2]))
+        strategy.exit("Exit L", from_entry = "Long", stop = trailArmed ? trailStop : plannedStop)
+    else
+        strategy.exit("Exit L", from_entry = "Long", stop = plannedStop, limit = plannedEntry + fixedTargetR * entryRiskPerShare)
+
+if strategy.position_size < 0 and not na(plannedStop)
+    if isTrailMode
+        if not trailArmed and not na(lvlR2) and low <= lvlR2
+            trailArmed := true
+            trailStop  := plannedStop
+        if trailArmed
+            trailStop := math.min(nz(trailStop, plannedStop), math.max(high[1], high[2]))
+        strategy.exit("Exit S", from_entry = "Short", stop = trailArmed ? trailStop : plannedStop)
+    else
+        strategy.exit("Exit S", from_entry = "Short", stop = plannedStop, limit = plannedEntry - fixedTargetR * entryRiskPerShare)
+
+// End-of-day flat: close everything in the EOD window
+if inEodWindow and strategy.position_size != 0
+    strategy.close_all(comment = "EOD")
+
+// =============================================================================
+// R-BASED PERFORMANCE TRACKING
+// =============================================================================
+var float totalR       = 0.0
+var int   winCount     = 0
+var int   lossCount    = 0
+var float grossWinR    = 0.0
+var float grossLossR   = 0.0
+var float peakR        = 0.0
+var float maxDrawdownR = 0.0
+var float bestR        = na
+var float worstR       = na
+
+newClosedTrade = strategy.closedtrades > nz(strategy.closedtrades[1])
+
+if newClosedTrade
+    float tradeProfit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    float riskDollars = not na(entryQty) and not na(entryRiskPerShare) ? entryQty * entryRiskPerShare : 0.0
+    float realizedR   = riskDollars > 0 ? tradeProfit / riskDollars : 0.0
+    totalR := totalR + realizedR
+    if realizedR >= 0
+        winCount  := winCount + 1
+        grossWinR := grossWinR + realizedR
+    else
+        lossCount  := lossCount + 1
+        grossLossR := grossLossR + realizedR
+    peakR := math.max(peakR, totalR)
+    maxDrawdownR := math.max(maxDrawdownR, peakR - totalR)
+    bestR  := na(bestR) ? realizedR : math.max(bestR, realizedR)
+    worstR := na(worstR) ? realizedR : math.min(worstR, realizedR)
+    if showTradeLabels
+        string rTxt = (realizedR >= 0 ? "+" : "") + str.tostring(realizedR, "#.0") + "R"
+        label.new(bar_index, high, rTxt,
+          style = realizedR >= 0 ? label.style_label_down : label.style_label_up,
+          color = realizedR >= 0 ? color.new(color.green, 20) : color.new(color.red, 20),
+          textcolor = color.white, size = size.small)
+
+// =============================================================================
+// PERFORMANCE TABLE (R-based, primary metric = Net R)
+// =============================================================================
+var table perfTable = table.new(position.bottom_right, 2, 14, border_width = 1)
+
+if barstate.islast and showPerformanceTable
+    int   totalTrades = winCount + lossCount
+    float winRate     = totalTrades > 0 ? 100.0 * winCount / totalTrades : 0.0
+    float avgR        = totalTrades > 0 ? totalR / totalTrades : 0.0
+    float avgWinR     = winCount > 0 ? grossWinR / winCount : 0.0
+    float avgLossR    = lossCount > 0 ? grossLossR / lossCount : 0.0
+    float profitFactorR = math.abs(grossLossR) > 0 ? grossWinR / math.abs(grossLossR) : na
+
+    color headBg  = color.new(color.gray, 60)
+    color cellBg  = color.new(color.black, 70)
+    color netBg   = totalR >= 0 ? color.new(color.green, 40) : color.new(color.red, 40)
+    color txtCol  = color.white
+
+    table.cell(perfTable, 0, 0, "Trades", bgcolor = headBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 1, 0, str.tostring(totalTrades), bgcolor = cellBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 0, 1, "Wins", bgcolor = headBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 1, 1, str.tostring(winCount), bgcolor = cellBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 0, 2, "Win rate", bgcolor = headBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 1, 2, str.tostring(winRate, "#.#") + "%", bgcolor = cellBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 0, 3, "NET R", bgcolor = netBg, text_color = txtCol, text_size = size.normal)
+    table.cell(perfTable, 1, 3, (totalR >= 0 ? "+" : "") + str.tostring(totalR, "#.##") + "R", bgcolor = netBg, text_color = txtCol, text_size = size.normal)
+    table.cell(perfTable, 0, 4, "Avg R / trade", bgcolor = headBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 1, 4, str.tostring(avgR, "#.##") + "R", bgcolor = cellBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 0, 5, "Avg winner", bgcolor = headBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 1, 5, str.tostring(avgWinR, "#.##") + "R", bgcolor = cellBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 0, 6, "Avg loser", bgcolor = headBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 1, 6, str.tostring(avgLossR, "#.##") + "R", bgcolor = cellBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 0, 7, "Profit factor (R)", bgcolor = headBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 1, 7, na(profitFactorR) ? "n/a" : str.tostring(profitFactorR, "#.##"), bgcolor = cellBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 0, 8, "Max drawdown", bgcolor = headBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 1, 8, str.tostring(maxDrawdownR, "#.##") + "R", bgcolor = cellBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 0, 9, "Best trade", bgcolor = headBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 1, 9, na(bestR) ? "n/a" : str.tostring(bestR, "#.##") + "R", bgcolor = cellBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 0, 10, "Worst trade", bgcolor = headBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 1, 10, na(worstR) ? "n/a" : str.tostring(worstR, "#.##") + "R", bgcolor = cellBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 0, 11, "Level source", bgcolor = headBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 1, 11, levelSource, bgcolor = cellBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 0, 12, "Capital", bgcolor = headBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 1, 12, "$1,100 (underlying proxy)", bgcolor = cellBg, text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 0, 13, "Reminder", bgcolor = color.new(color.orange, 40), text_color = txtCol, text_size = size.small)
+    table.cell(perfTable, 1, 13, "Backtests underlying, not options", bgcolor = color.new(color.orange, 40), text_color = txtCol, text_size = size.small)
+
+// =============================================================================
+// PLOTTING
+// =============================================================================
+// Active break-level pair renders with linewidth 2; the inactive pair stays
+// at linewidth 1. (levelSource is an input, so the ternary is input-qualified
+// and legal for plot linewidth.)
+plot(pdh, "PDH", color = color.red, linewidth = usePdLevels ? 2 : 1, style = plot.style_linebr)
+plot(pdl, "PDL", color = color.green, linewidth = usePdLevels ? 2 : 1, style = plot.style_linebr)
+plot(pdc, "PDC", color = color.gray, linewidth = 1, style = plot.style_linebr)
+plot(pmh, "PMH", color = color.orange, linewidth = 1, style = plot.style_linebr)
+plot(pml, "PML", color = color.purple, linewidth = 1, style = plot.style_linebr)
+plot(orh, "ORH", color = color.yellow, linewidth = usePdLevels ? 1 : 2, style = plot.style_linebr)
+plot(orl, "ORL", color = color.aqua, linewidth = usePdLevels ? 1 : 2, style = plot.style_linebr)
+plot(sessionVwap, "Session VWAP", color = color.blue, linewidth = 3, style = plot.style_linebr)
+plot(ema9, "EMA 9", color = color.new(color.teal, 30), linewidth = 1)
+plot(ema20, "EMA 20", color = color.new(color.maroon, 30), linewidth = 1)
+
+// Trade levels (persist through the day after entry)
+plot(plannedEntry, "Entry", color = color.white, linewidth = 1, style = plot.style_linebr)
+plot(plannedStop, "Stop", color = color.red, linewidth = 3, style = plot.style_linebr)
+plot(lvlR1, "1R", color = color.new(color.green, 75), linewidth = 1, style = plot.style_linebr)
+plot(lvlR2, "2R", color = color.new(color.green, 60), linewidth = 1, style = plot.style_linebr)
+plot(lvlR3, "3R", color = color.new(color.green, 45), linewidth = 1, style = plot.style_linebr)
+plot(lvlR4, "4R", color = color.new(color.green, 25), linewidth = 1, style = plot.style_linebr)
+plot(lvlR5, "5R", color = color.new(color.green, 0), linewidth = 1, style = plot.style_linebr)
+
+// Entry-window shading and setup markers
+bgcolor(inEntryWindow ? color.new(color.blue, 92) : na, title = "Entry window")
+plotshape(longEntryFired, "CALL setup", shape.triangleup, location.belowbar, color.new(color.green, 0), text = "CALL", textcolor = color.green, size = size.small)
+plotshape(shortEntryFired, "PUT setup", shape.triangledown, location.abovebar, color.new(color.red, 0), text = "PUT", textcolor = color.red, size = size.small)

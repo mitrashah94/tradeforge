@@ -1,0 +1,4 @@
+braintrust>=0.0.125
+autoevals
+# optional: live model scoring for the decision + safety suites
+anthropic

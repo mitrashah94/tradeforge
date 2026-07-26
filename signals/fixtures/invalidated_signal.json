@@ -1,0 +1,14 @@
+{
+  "event": "INVALIDATED",
+  "event_id": "XLF-20260713-CALL-PDH-INVALIDATED-9430",
+  "ticker": "XLF",
+  "timeframe": "5",
+  "setup_type": "A_break_retest",
+  "direction": "CALL",
+  "level": "PDH",
+  "level_price": 51.20,
+  "signal_time_ct": "2026-07-13 09:41",
+  "vwap": 51.35,
+  "rvol": 1.33,
+  "reason": "closed_through_stop_after_qualified"
+}

@@ -1,64 +1,190 @@
-# CLAUDE.md
+# CLAUDE.md — DayTrading workspace
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Decision-support system for a small-account asymmetric options campaign.
+TradingView (analysis + signals) -> Claude (validation + math + journaling) ->
+Robinhood Legend (manual execution by the trader).
 
-> Full design rationale lives in [MASTER_PLAN.md](MASTER_PLAN.md). **This file is the operating contract** — mission, resolved P0 decisions, and the conventions every change must respect. MASTER_PLAN.md is the reasoning; this file is the rule.
+**At session start, read [`daytrading_memory.md`](daytrading_memory.md)** — the running
+state, decisions, account status, and hard-won gotchas — then this file and `strategy.md`.
+Keep `daytrading_memory.md` updated as things change (it replaces the old auto-memory).
 
-## Mission
+## Hard rules — non-negotiable
 
-TradeForge is an autonomous, self-improving systematic trading platform whose job is to **maximize compounded growth inside a fixed risk band while deterministic code makes catastrophic loss structurally impossible.**
+1. **Never place, modify, or cancel any order.** Robinhood MCP write tools
+   (`place_*`, `cancel_*`, `review_*` used to stage orders) are off-limits.
+   Read-only tools (quotes, chains, positions, portfolio) are fine.
+2. **Recommend the user to enter a trade.** Verify their written rules
+   against observable data; the decision and the submit click are theirs.
+3. **No other strategies.** The only strategy is [strategy.md](strategy.md).
+   Do not import ideas from other trading skills or memory.
+4. **Not a licensed advisor.** Process and math support only.
+5. Nothing in `signals/` may import, call, or reference a brokerage API.
 
-- **North star:** $1,000 + $50/week → $100,000.
-- **Milestones:** `$1k → $2.5k → $5k → $10k → $25k → $50k → $100k`. Each triggers a review and a gain-ratchet (see below).
+## File map
 
-## Two engines, sequenced
+| Path | What it is |
+|---|---|
+| `daytrading_memory.md` | Running memory: state, decisions, account, gotchas, session log (read first) |
+| `NEXT_SESSION_PLAN.md` | Handoff + the step-by-step options **Order Playbook** |
+| `strategy.md` | The operating plan (authoritative) |
+| `AGENTS.md` | Rules and schema for subagents |
+| `Trading_Journal.xlsx` | Trade log, weekly metrics, sim-qualification tracker (R unit lives in Settings!B4) |
+| `pine/asymmetric_live_signal.pine` | indicator() — levels + WATCH/QUALIFIED/REJECT/INVALIDATED/EXPIRED JSON alerts. No orders, no sizing. |
+| `pine/asymmetric_backtest_strategy.pine` | strategy() — underlying backtest, $1,100 capital, equity-capped sizing, R-based reporting |
+| `signals/receiver.py` | Local pipeline: parse -> validate -> dedupe -> decision card |
+| `signals/fixtures/` | Sample payloads for offline testing |
+| `signals/test_receiver.py` | Self-contained tests (plain asserts) |
+| `tradeforge/` | Dormant autonomous-platform repo (own CLAUDE.md, own venv), kept for later integration. NOT an active strategy source — hard rule 3 applies; nothing in it overrides strategy.md. |
+| `FEATURE_MAP.md` | Functional comparison of DayTrading vs tradeforge by pipeline stage: what lives where, what's integrated, what needs updating |
 
-- **Early (≈$1k–$10k): the $50/week deposit is the dominant force** (+5%/week on $1k, decaying to ~+0.5%/week by $10k). The job is to compound the edge *without bleeding deposits to costs* — preserve capital, validate, keep frictions honest.
-- **Later (account large enough that deposits are noise): the trading edge becomes the growth engine.**
+## Signal pipeline
 
-Build for both: capital-preservation-plus-validation early, aggressive-compounding once edges are proven. Never optimize the late-game engine at the cost of not-dying early.
+The Pine indicator emits single-line JSON on confirmed 5-minute closes only
+(`barstate.isconfirmed` + `alert.freq_once_per_bar_close`), one event per
+side per day, deduplicated by `event_id`. Canonical schema: see AGENTS.md.
 
-## The maximization thesis
+Local verification (no TradingView needed):
 
-Compounded (geometric) growth ≈ **mean return − variance/2.** Raise it two ways: raise the edge, and **cut the variance for a given edge.** The highest-leverage move is **stacking uncorrelated edges** — it smooths the equity curve, which lets you size larger at the same drawdown, which compounds faster. Aggression and survival align. **Size by conviction** (best moments get the most capital), not evenly across mediocre ones. The durable moat is *the rate at which we discover and validate new edges faster than old ones decay.*
+```bash
+python3 signals/receiver.py --all      # run every fixture
+python3 signals/receiver.py --demo     # built-in samples through full pipeline
+python3 signals/test_receiver.py       # assertions
+```
 
-## Resolved P0 decisions (§10)
+A QUALIFIED card is an *inspection prompt*, never an entry instruction.
 
-1. **Account wrapper — Taxable.** Keeps margin, unrestricted intraday day-trading, and the day-one crypto venue available (crypto is not IRA-eligible at Robinhood). *Consequence:* realized gains are short-term/ordinary income → carry a **tax-reserve ledger line** and track **after-tax equity** as a first-class metric; compounding uses after-tax dollars.
-2. **Broker (Robinhood) post-PDT status — unverified.** *Consequence:* assume **legacy PDT until proven.** Build the **cash-account path first** (settled cash, T+1, no same-dollar same-day round-trips); keep margin day-trading behind a config flag that flips only after the broker's risk-based-margin adoption is confirmed (required before P6).
-3. **Native OCO brackets — NOT available** via the Robinhood agentic API. `place_equity_order` is **single-leg** (market / limit / stop_market / stop_limit), has **no bracket parameter**, and is **equities-only** (no options, no crypto order endpoint). *Consequence:* brackets are **simulated locally by the deterministic fast loop**, the **dead-man's switch is mandatory**, and crypto + options each require a **separate execution path**.
-4. **Starting risk index — RI 5, ramping to 8.** `risk/limits.yaml` opens with **floor = 5.** *Consequence:* the step-up toward 8 is a **manual, gated decision driven by proven paper/live performance — never auto-tuned from live P&L.** Conviction tiering flexes within `[current floor, 8]`.
-5. **Launch scope — one live edge + two in research.** Take the single validated `breakout_retest` live as soon as it clears paper→live; carry `level_meanrev` + `momentum_thrust` as PAPER/RESEARCH in `strategies/registry.yaml`. *Consequence:* real-cost/slippage capture and the research conveyor start early, and the **live correlation matrix is tracked from day one** so the 2nd/3rd edge is admitted on *low correlation*, not raw PF.
+## TradingView MCP — hard-won quirks
 
-## Conventions (every change respects these)
+- `pine_set_source` writes a **hidden headless editor**, not the visible one.
+  Compiling there works and `pine_get_source` reads it back, but **it cannot
+  be saved to the script library**. The visible editor rejects synthetic
+  paste and auto-indent mangles synthetic typing. **Source injection into a
+  library script requires the user's hands**: put the source on the system
+  clipboard (`pbcopy < file`), then have the user Cmd+A / Cmd+V / Cmd+S in
+  the Pine editor. Verify afterwards via `pine_list_scripts` (title +
+  modified timestamp change).
+- `layout_switch` reports success without switching; use the Manage-layouts
+  menu (`ui_click` data-name `save-load-menu`, then click the layout link
+  via `ui_evaluate`).
+- "Make a copy" in the editor copies the **visible** editor's script.
+- Strategy Tester **initial capital override** silently rejects orders the
+  capital cannot fund (this produced "no trade data" once). The backtest
+  script itself now sets 1100 and sizes affordably — do not override it.
+- Alerts must be recreated per chart/symbol. Each morning, on the chosen
+  candidate's chart: alert condition = "Asymmetric Live Signal v2" +
+  **"QUALIFIED (any)"**.
+  **NEVER use "Any alert() function call".** That pipes **WATCH** to the
+  trader's screen with the same weight as QUALIFIED. On 2026-07-13 he mistook
+  WATCH for QUALIFIED and believed he had two setups when the engine produced
+  **zero**. WATCH is not a setup and not an entry. Only QUALIFIED may ever
+  interrupt him. Add the "INVALIDATED" alert only once he is actually in a
+  position. Claude still consumes the full event stream for context.
+- **`pine_set_source` + save writes to whichever script is OPEN in the VISIBLE
+  Pine editor.** `pine_open` does NOT reliably switch it. This has clobbered a
+  library script. Before any write: `pine_list_scripts`, confirm the target is
+  the open one, and verify title + modified timestamp afterwards. The on-disk
+  `pine/*.pine` files are the source of truth and make any clobber recoverable.
+  Safest path for a library install is still clipboard + the user's Cmd+A/V/S.
+- Pane indexes in 2x2 layouts do not map left-right/top-bottom; verify with
+  a screenshot after `pane_set_symbol`.
 
-- **Paper-first.** Nothing reaches live until it clears the gates — backtest→paper (≥100 trades, PF ≥ 1.5, OOS required, cost-realistic) and paper→live (≥30 paper trades, PF ≥ 1.3, maxDD ≤ 10%, net of costs). Paper and live ride the **identical event path.**
-- **LLM decides policy; deterministic code executes the fast loop and protects.** Agents set the board (regime, arming, sizing policy, research); plain Python clicks the buttons and enforces the limits. **No LLM and no MCP calls in the hot path.** The thing touching money has the least autonomy and zero latency.
-- **No live orders without hook approval.** A `PreToolUse` hook in `.claude/settings.json` blocks live-order endpoints unless explicitly gated. Default to paper; route live through `order_gateway`. Before any real order: `review_equity_order` → confirm → `place_equity_order` (agentic_allowed account only). **Never bypass the hook.**
-- **pip3 only** for Python packages (no conda, no bare `pip`).
-- **Self-improvement upgrades the *pipeline*, never the live knobs.** Forbidden: tuning live params from live P&L; changing a strategy in reaction to a drawdown (you may only demote/halt); intra-week edits; any LLM writing live config or `limits.yaml`; promoting on in-sample results. Research agents read everything, write nothing live.
-- **`risk/limits.yaml` is the single source of truth** for the risk-index table, ratchet, and abort thresholds. Edit it by hand, deliberately.
+## Daily assistant workflow (CT)
 
-## Risk dial & protections
+1. **07:45–08:15** — pull premarket data for SPY/QQQ/XLF/XLE/IWM
+   (TradingView MCP + Robinhood read-only), fill the scorecard from
+   strategy.md section 9, check the economic calendar, check option-chain
+   liquidity on the top two candidates.
+2. **08:30** — confirm candidate chart loaded, indicator running, alert
+   created, Robinhood buying power + account type confirmed by user.
+3. **08:45–10:30** — entry window. On QUALIFIED: run the card through
+   `signals/receiver.py`, verify plan gates, compute the option-contract
+   feasibility check (see strategy.md section 7), read out passing
+   contracts. User decides.
+4. After any trade: journal row in Trading_Journal.xlsx (both before-entry
+   and after-exit fields), screenshots via `capture_screenshot`.
+5. **14:55** — remind user to be flat.
+6. **After the close — RECORD THE SESSION. Every day, including no-trade days.**
+   See the learning loop below. This is not optional; a no-trade day that goes
+   unrecorded is the single best-behaved day in the system's history vanishing.
 
-**Risk index — one knob (band 5–8, current floor 5).** Per-trade risk is always **% of current equity**, recomputed each trade. **Conviction tiering flexes the dial within the band: B → 5, A → 6–7, A+ → 8**, so size tracks edge automatically.
+## The learning loop (run it every session, trade or no trade)
 
-| RI | Per-trade | Concurrent | Daily halt | Weekly halt | Heat |
-|----|-----------|------------|-----------|-------------|------|
-| 5 (floor) | 1.0% | 2–3 | 2% | 5% | 3% |
-| 6 | 1.25% | 3 | 2.5% | 6% | 4% |
-| 7 | 1.5% | 3–4 | 3% | 7% | 5% |
-| 8 | 2.0% | 4 | 3.5% | 8% | 6% |
+The journal is one row per **trade**. That means a disciplined **no-trade day
+produced zero rows anywhere** — the system could not see its own best behavior,
+and strategy.md §13 requires *"3 intentional no-trade sessions"* it had no way to
+evidence. `backtests/sessions.jsonl` is one row per **day** and closes that hole.
 
-**Milestone ratchet (maximize *and* protect).** At each milestone, sweep **25% of gains** into a **vault sleeve the aggressive engine cannot touch.** Press with the rest; structurally protect the milestone from giveback.
+**Daily, after the close:**
 
-**Program-abort — NOT on the risk dial, always on.** **−20% in a calendar month → mandatory review; −35% from the all-time equity high → halt + manual restart.** These are insurance against bugs, disconnects, and death-spirals — not risk appetite — and are never adjusted by the dial. Also always-on alongside them: broker-vs-ledger reconciliation halt, dead-man's switch, and orphan-order recovery on every boot.
+1. Save the day's 5m bars + `levels.json` for the watched tickers into
+   `backtests/session_YYYY-MM-DD/` (SPY/QQQ too — "candidate fights SPY/QQQ" is a
+   §5 no-trade condition, so auditing a no-trade day sometimes *requires* them).
+2. `python3 analysis/replay_session.py --session backtests/session_YYYY-MM-DD`
+   — reruns the exact four-track engine offline and writes `events.json`.
+3. `python3 analysis/record_session.py` — appends one row to
+   `backtests/sessions.jsonl`. The **verdict is derived, never asserted**: it is the
+   2x2 of *(engine had a QUALIFIED?)* x *(trader acted?)* →
+   `CORRECT_TRADE` | `CORRECT_NO_TRADE` | `MISSED_SIGNAL` | `OFF_PLAN_TRADE`.
+   The trader does not get to grade his own homework.
+4. One line in `daytrading_memory.md`'s session log.
 
-## Lean agent roster (~4 to start)
+**Weekly (Friday):** regenerate `reports/learning_report.md` and answer, verbatim:
 
-- **regime-reader** — daily regime/vol/IV tag → arms strategies, sets the exposure scalar.
-- **strategy-researcher** — offline mining, backtests, walk-forward (reads everything, writes nothing live).
-- **journalist** — auto per-trade journals + premarket/EOD digests with chart PNGs.
-- **performance-analyst** — equity curve, alpha-vs-SPY, decay detection, milestone + ratchet, risk-of-ruin estimate.
+> *"Did every session get recorded and replayed, and did my action match the
+> engine's state in ≥80% of sessions? If not, which cell of the matrix am I
+> living in?"*
 
-Defer `catalyst-watcher`, `watchlist-curator` (start as a weekly script), and `options-strategist` until capital and validation justify them. Model tiers: Haiku for routine, Sonnet/Opus for research — track API cost as a P&L line.
+**What the loop actually learns — two numbers, nothing else:**
+
+- **Decision accuracy** = (CORRECT_TRADE + CORRECT_NO_TRADE) / sessions. Target ≥80%,
+  mirroring the §13 adherence gate. *Currently 50% (n=2).*
+- **QUALIFIED frequency.** If the strategy almost never fires, the edge is
+  **unvalidatable no matter how disciplined he is** — a completely different problem
+  from adherence, and one that would otherwise be invisible. *Currently 0.00/session.*
+
+**Standing caveats, restated in every weekly review:**
+
+- **ORB same-bar priority remains UNVALIDATED** (6-trade sample).
+- **Open question — the pre-window REJECT.** On 2026-07-13 XLF's PDH track broke at
+  08:30 and REJECTed at **08:40, five minutes before the 08:45 entry window opened** —
+  burned for the day before the trader was even allowed to trade. ORB tracks are
+  structurally immune (the OR completes at 08:45), so only PD tracks die this way.
+  Decide it with `replay_session.py` over ~20 accumulated sessions, **not with priors**.
+  Do NOT gate the *break* to 08:45 — that would kill the good 08:35-break/08:50-retest.
+
+**Hypotheses are tested by rerunning `replay_session.py` variants over the accumulated
+session dirs.** The sessions are the corpus. Do not add a database, a dashboard, or an
+"insights engine" — this is a one-person system and an elaborate pipeline will rot.
+
+**R does not move on deposits.** strategy.md §1 raises R only after **five correctly
+executed trades** — execution quality, not P&L, and not account size. That counter is
+still at **zero** (Day 1 was off-plan). A $200 deposit does not change 1R = $25.
+
+## Journal conventions
+
+One row per trade or sim. Realized R = net option P&L / Settings!B4.
+Never overwrite formula columns (J–O, R, W, AA–AB, AF–AG, AP).
+Weekly metrics compute themselves; the metric that matters most is
+rule-adherence %.
+
+## Model workflow
+
+The main Claude Code session is the orchestrator.
+
+For non-trivial tasks:
+
+1. Inspect the relevant files and repository state.
+2. Consult the configured Fable advisor before committing to an
+   implementation approach.
+3. Create a bounded implementation brief.
+4. Delegate code implementation to the `sonnet-coder` subagent.
+5. Inspect the resulting diff and test output.
+6. Consult the Fable advisor again before declaring a consequential
+   change complete.
+
+Use the advisor when requirements are ambiguous, architecture decisions
+are involved, an implementation fails, or a consequential change appears
+ready for completion.
+
+Do not use Fable as a file-editing agent. Fable is the strategic advisor.
+Use `sonnet-coder` for implementation.
