@@ -87,9 +87,14 @@ def test_program_abort_monthly_review():
 
 def test_dial_daily_halt():
     book = BookState(cash=0.0, prev_nav=100_000.0)
-    # RI6 daily_halt_pct = 2.5%. -3% vs prior close -> halt.
-    assert dial_halt(97_000.0, book, LIMITS) is not None
-    assert dial_halt(99_000.0, book, LIMITS) is None
+    # The daily halt trigger comes from the operator's current floor row's
+    # daily_halt_pct; test a drop just past it (halts) and one just short
+    # of it (doesn't) instead of a number hardcoded to one RI's threshold.
+    halt_pct = LIMITS.level(LIMITS.default_ri).daily_halt_pct
+    over_threshold = 100_000.0 * (1.0 - (halt_pct + 0.5) / 100.0)
+    under_threshold = 100_000.0 * (1.0 - (halt_pct - 0.5) / 100.0)
+    assert dial_halt(over_threshold, book, LIMITS) is not None
+    assert dial_halt(under_threshold, book, LIMITS) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -116,7 +121,13 @@ def test_heat_admission_stops_at_portfolio_heat_pct():
     row = LIMITS.level(LIMITS.default_ri)
     heat_cap = row.portfolio_heat_pct / 100.0 * equity
     cand_risk = per_trade_dollar_risk(equity, resolve_ri("A+", LIMITS), LIMITS)
-    n_by_heat = int(heat_cap // cand_risk)
+    # Walk the exact admission arithmetic (running total vs. cap + epsilon)
+    # rather than a float floor-division, to match admit_candidates' own
+    # boundary handling exactly.
+    n_by_heat, running = 0, 0.0
+    while n_by_heat < 5 and running + cand_risk <= heat_cap + 1e-9:
+        running += cand_risk
+        n_by_heat += 1
     n_admit = min(n_by_heat, row.max_concurrent)
     assert n_admit >= 1, "test setup: no A+ candidate fits under this config's heat cap"
 
@@ -155,18 +166,19 @@ def test_family_cap_binds_below_book_cap():
 
 
 def test_concurrency_cap_stops_walk():
-    # Enough small (grade B) candidates that the book heat cap never binds, so
-    # whatever admits fewer than all of them must be the concurrency cap —
-    # letting the expected admitted count track the operator's current
-    # max_concurrent for this RI row instead of a hardcoded number.
+    # Construct each candidate's per-trade dollar risk directly (via the
+    # admission walk's `scalar` lever, rather than picking a conviction grade
+    # and hoping its resolved-RI risk happens to leave headroom) so
+    # CONCURRENCY provably binds before HEAT for ANY operator-set floor:
+    # admitting every one of `n` candidates would still stay under the heat
+    # cap with margin, so the walk can only be stopped by max_concurrent.
     equity = 100_000.0
     row = LIMITS.level(LIMITS.default_ri)
-    cand_risk = per_trade_dollar_risk(equity, resolve_ri("B", LIMITS), LIMITS)
     heat_cap = row.portfolio_heat_pct / 100.0 * equity
     n = row.max_concurrent + 2
-    assert row.max_concurrent * cand_risk <= heat_cap + 1e-9, (
-        "test setup: the heat cap would bind before concurrency for this config"
-    )
+    target_risk = heat_cap / (n + 1)   # n * target_risk < heat_cap, with margin
+    base_risk = per_trade_dollar_risk(equity, resolve_ri("B", LIMITS), LIMITS)
+    scalar = target_risk / base_risk
     cands = []
     for i in range(n):
         sym = chr(ord("A") + i)
@@ -174,6 +186,7 @@ def test_concurrency_cap_stops_walk():
                       entry_price=1000.0, stop=995.0, atr=2.0, family=sym)
         c.norm_score = 1.0 - i * 0.1
         cands.append(c)
-    opens, rejected = admit_candidates(cands, equity, LIMITS, PCFG, available_cash=1e9)
+    opens, rejected = admit_candidates(cands, equity, LIMITS, PCFG, scalar=scalar,
+                                       available_cash=1e9)
     assert len(opens) == row.max_concurrent
     assert any("concurrency" in why for _c, why in rejected)

@@ -275,6 +275,16 @@ def test_heat_cap_limits_concurrent_opens():
     # base tier IS band_high, so it resolves to RI8 regardless of the
     # operator's floor). How many fit under the CURRENT book heat cap (also
     # clamped by max_concurrent) is derived from config, not hardcoded.
+    #
+    # stop_atr_mult is widened (25, vs. the BracketConfig default ~2.5) so the
+    # per-share stop distance is a LARGE fraction of entry price. At a higher
+    # per_trade_pct (RI7/RI8) a narrow stop makes shares*entry (notional) blow
+    # past available cash before the heat cap binds -- size_candidate then
+    # cash-clips the position and RECOMPUTES a smaller dollar_risk for it,
+    # which can let it slip back under the heat cap and admit one more name
+    # than the heat-only math predicts. A wide stop keeps notional a small
+    # fraction of equity at every supported RI so cash-clipping never
+    # interferes and the heat cap is the only thing this test exercises.
     syms = ["AAA", "BBB", "CCC"]
     panel = _panel({s: [(100, 101, 99, 100)] * 5 for s in syms})
     close = panel["close"]
@@ -287,12 +297,23 @@ def test_heat_cap_limits_concurrent_opens():
             return {"AAA": 3.0, "BBB": 2.0, "CCC": 1.0}.get(symbol)
     # distinct families so the per-family cap never binds; book heat is the gate.
     sleeves = [SleeveSpec(name="brk", strategy=AllThree(), kind="score", grade="A+",
-                          family="trend", bracket=BracketConfig(atr_window=2))]
+                          family="trend",
+                          bracket=BracketConfig(atr_window=2, stop_atr_mult=25))]
     limits = load_limits()
     row = limits.level(limits.default_ri)
     cand_risk = per_trade_dollar_risk(100_000.0, resolve_ri("A+", limits), limits)
     heat_cap = row.portfolio_heat_pct / 100.0 * 100_000.0
-    n_admit = min(int(heat_cap // cand_risk), row.max_concurrent, len(syms))
+    # Walk the exact admission arithmetic (running total vs. cap + epsilon)
+    # rather than a float floor-division, to match admit_candidates' own
+    # boundary handling exactly.
+    n_by_heat, running = 0, 0.0
+    for _ in syms:
+        if running + cand_risk <= heat_cap + 1e-9:
+            running += cand_risk
+            n_by_heat += 1
+        else:
+            break
+    n_admit = min(n_by_heat, row.max_concurrent, len(syms))
     assert n_admit >= 1, "test setup: no A+ candidate fits under this config's heat cap"
 
     eng = PortfolioEngine(sleeves, pcfg=_small_synth_pcfg())
